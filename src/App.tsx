@@ -1748,7 +1748,7 @@ function App() {
       {contextHolder}
       <Layout.Sider className="app-sider" width={264} theme="light" breakpoint="lg" collapsedWidth={0}>
         <div className="brand-lockup">
-          <img className="brand-logo" src="/images/logo.png" alt="Landmark Group" />
+          <img className="brand-logo" src={`${import.meta.env.BASE_URL}images/logo.png`} alt="Landmark Group" />
         </div>
         <div className="workspace-label">WORKSPACE</div>
         <Menu
