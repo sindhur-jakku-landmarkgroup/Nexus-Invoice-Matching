@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Scaffold ReIM React prototype",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"create",
+				"vite@latest",
+				".",
+				"--yes",
+				"--",
+				"--template",
+				"react-ts",
+				"--no-interactive"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
