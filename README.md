@@ -23,11 +23,11 @@ Run the mock-service checks with `corepack yarn test`.
 
 - Invoice worklist with search and status filters.
 - Order cards are paginated (10 per page by default); changing filters or page size returns to the first page.
-- Dashboard counts cover all prototype documents regardless of filters. Pending Invoices is the sum of Ready to Match invoices and invoices matched today; Matched Today uses the browser's local date and includes matches shared by the mock service. Unposted Notes, Requests & Memos counts credit notes, requests and memos that are not Posted. The status filter and queue export use document statuses. Exception reporting flags selected invoices without changing their status; confirmation clears their exception flag and marks them Matched.
-- Invoice statuses are Ready to Match, Matched, and Posted. The mock service simulates overnight posting on the next day in the server's local time zone; no actual posting occurs. A Ready to Match status does not mean the current selection is ready to confirm. If filters hide selected invoices, the card warns that they still count in the totals and offers to clear them.
+- Dashboard counts cover all prototype documents regardless of filters. Pending Invoices is the sum of Ready to Match invoices and invoices matched today; Matched Today uses the browser's local date and includes matches from the active mock mode. Unposted Notes, Requests & Memos counts credit notes, requests and memos that are not Posted. The status filter and queue export use document statuses. Exception reporting flags selected invoices without changing their status; confirmation clears their exception flag and marks them Matched.
+- Invoice statuses are Ready to Match, Matched, and Posted. Overnight posting is simulated on the next day in the server's local time zone, or the browser's local time zone in browser-only demo mode; no actual posting occurs. A Ready to Match status does not mean the current selection is ready to confirm. If filters hide selected invoices, the card warns that they still count in the totals and offers to clear them.
 - Invoice detail and line-level receipt comparison.
 - Explicit receipt-number selection for orders with multiple receipts.
-- Confirming a match reserves its receipts for the selected invoice group. Each Matched or Posted group appears separately with its invoices and receipts side by side, without selection checkboxes. Users connected to the same mock server see updates through polling; confirmation handles competing claims with a conflict response.
+- Confirming a match reserves its receipts for the selected invoice group. Each Matched or Posted group appears separately with its invoices and receipts side by side, without selection checkboxes. Users connected to the same mock server see updates through polling; confirmation handles competing claims with a conflict response. In browser-only demo mode, reservations are limited to the current browser profile.
 - View Match Details for a completed group shows the original quantity and cost comparison, recorded resolution choices, reasons and comments, and invoice totals at confirmation. A group does not imply individual invoice-to-receipt allocations. Seeded historical matches have no recorded resolution details and display them as unavailable.
 - Select the information icon on an order card to see its matching scenario:
 
@@ -57,6 +57,8 @@ Run the mock-service checks with `corepack yarn test`.
 - Separate ReIM, OFIN, and Cognix integration statuses; Cognix screens and user-triggered Cognix actions are out of scope.
 
 ## Mock service and engineering handoff
+
+The GitHub Pages build uses browser-only demo mode: confirmed matches and receipt reservations are saved in the current browser's local storage and survive refreshes. They are shared between tabs using the same browser profile, but not with other users, devices, or browsers. Clearing site data removes them. Browser storage and Web Locks must be available; if not, matching is disabled with an error. This is simulated data, not a shared or production service. Created documents and other edits are not saved on refresh.
 
 The Vite development and preview servers provide an in-memory matching service. Matches, receipt reservations, and the original comparison and resolution details recorded at confirmation are shared between browser tabs using the same server and survive browser refreshes. The server resets to the seeded examples when it restarts; separate server processes do not share state. If the service is unavailable, receipt selection and match confirmation are disabled until it reconnects. Created documents, edits, selections, unconfirmed resolutions, and reports are browser-local and are not shared or persisted on refresh.
 

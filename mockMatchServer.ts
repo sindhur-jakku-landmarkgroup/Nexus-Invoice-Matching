@@ -1,38 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { Plugin, ViteDevServer, PreviewServer } from 'vite';
-import { isMatchDetails } from './src/mockMatches';
-import type { MockMatch, MockMatchState } from './src/mockMatches';
-
-const historicalExamples = [
-  { orderNo: '6502411', receiptCounts: [1] },
-  { orderNo: '6502412', receiptCounts: [2] },
-  { orderNo: '6502413', receiptCounts: [2] },
-  { orderNo: '6502414', receiptCounts: [2] },
-  { orderNo: '6502415', receiptCounts: [1, 1] },
-  { orderNo: '6502416', receiptCounts: [1, 1] },
-  { orderNo: '6502417', receiptCounts: [1, 1] },
-  { orderNo: '6502420', receiptCounts: [1] },
-];
-
-const initialMatches: MockMatch[] = [
-  ...historicalExamples.flatMap(({ orderNo, receiptCounts }) =>
-    receiptCounts.map((count, index) => ({
-      orderNo,
-      invoiceIds: [`EX-${orderNo}-${index + 1}`],
-      receiptNos: Array.from({ length: count }, (_, receiptIndex) => `RCP-${orderNo}-${index + 1}-${receiptIndex + 1}`),
-      matchedAt: '2026-10-01T00:00:00.000Z',
-      status: 'Posted' as const,
-    })),
-  ),
-  {
-    orderNo: '6502401',
-    invoiceIds: ['IM-SAMPLE-11'],
-    receiptNos: ['RCP-SAMPLE-11'],
-    matchedAt: '2026-11-09T00:00:00.000Z',
-    status: 'Posted',
-  },
-];
+import { hasMatchConflict, initialMatches, isMatchDetails } from './src/mockMatches';
+import type { MockMatchState } from './src/mockMatches';
 
 const isStringList = (value: unknown): value is string[] =>
   Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string' && item.trim() === item && item.length > 0)
@@ -109,10 +79,7 @@ export function mockMatchServer(): Plugin {
           send(res, 400, { error: 'Match details must identify each selected invoice.' });
           return;
         }
-        const conflict = matches.some(match =>
-          match.invoiceIds.some(id => invoiceIds.includes(id))
-          || (match.orderNo === orderNo && match.receiptNos.some(number => receiptNos.includes(number))),
-        );
+        const conflict = hasMatchConflict(matches, { orderNo, invoiceIds, receiptNos, details });
         if (conflict) {
           send(res, 409, { error: 'An invoice or receipt has already been matched.', ...currentState() });
           return;

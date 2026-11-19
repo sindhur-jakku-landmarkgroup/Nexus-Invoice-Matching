@@ -48,6 +48,7 @@ import {
   Typography,
 } from 'antd';
 import type { MenuProps, TableColumnsType } from 'antd';
+import { getBrowserMatches, saveBrowserMatch } from './browserMatches';
 import { isMockMatchState } from './mockMatches';
 import type { MatchDetails, MatchResolution, MockMatch, MockMatchState } from './mockMatches';
 
@@ -62,6 +63,7 @@ const noteMemoTypes = [
   'Credit Memo - Cost',
   'Credit Memo - Quantity',
 ] as const;
+const browserMatchDemo = import.meta.env.VITE_MATCH_MODE === 'browser';
 type NoteMemoType = typeof noteMemoTypes[number];
 type InvoiceStatus = 'Ready to Match' | 'Matched' | 'Posted' | 'Approved';
 type InvoiceType = 'CDC' | 'CFS' | 'RDC' | 'Local' | 'DSD' | 'Direct' | NoteMemoType;
@@ -844,10 +846,16 @@ function App() {
     let active = true;
     const refreshMatches = async () => {
       try {
-        const response = await fetch('/api/mock/matches', { cache: 'no-store' });
-        if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
-        const data: unknown = await response.json();
-        if (!isMockMatchState(data)) throw new Error('Match service returned invalid data.');
+        let data: MockMatchState;
+        if (browserMatchDemo) {
+          data = await getBrowserMatches();
+        } else {
+          const response = await fetch('/api/mock/matches', { cache: 'no-store' });
+          if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
+          const result: unknown = await response.json();
+          if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
+          data = result;
+        }
         if (active) {
           updateMatchState(data);
           setMatchServiceError('');
@@ -1594,19 +1602,32 @@ function App() {
     setPostingProgressOpen(true);
     
     try {
-      const response = await fetch('/api/mock/matches', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ orderNo, invoiceIds: selectedInvoiceIds, receiptNos, details }),
-      });
-      const data: unknown = await response.json();
-      if (response.status === 409 && isMockMatchState(data)) {
+      const request = { orderNo, invoiceIds: selectedInvoiceIds, receiptNos, details };
+      let data: MockMatchState;
+      let conflict: boolean;
+      if (browserMatchDemo) {
+        const result = await saveBrowserMatch(request);
+        data = result.state;
+        conflict = result.conflict;
+      } else {
+        const response = await fetch('/api/mock/matches', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        });
+        const result: unknown = await response.json();
+        if (response.status !== 409 && !response.ok) throw new Error(`Match service returned ${response.status}.`);
+        if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
+        data = result;
+        conflict = response.status === 409;
+      }
+      if (conflict) {
         updateMatchState(data);
-        messageApi.warning('An invoice or receipt was matched by another user. Review the updated selection.');
+        messageApi.warning(browserMatchDemo
+          ? 'An invoice or receipt was already matched in this browser. Review the updated selection.'
+          : 'An invoice or receipt was matched by another user. Review the updated selection.');
         return;
       }
-      if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
-      if (!isMockMatchState(data)) throw new Error('Match service returned invalid data.');
       updateMatchState(data);
       setMatchServiceError('');
       const now = new Date();
@@ -1796,6 +1817,12 @@ function App() {
               <Button icon={<DownloadOutlined />} onClick={handleExport}>Export queue</Button>
             </Space>
           </div>
+
+          {browserMatchDemo && (
+            <Typography.Paragraph>
+              Demo mode: matches are saved in this browser only and are not shared with other users.
+            </Typography.Paragraph>
+          )}
 
           <div className="metrics-row">
             <Card className="metric-card"><Statistic title={<span title="Ready to Match plus Matched Today">Pending Invoices</span>} value={pendingInvoices} /></Card>
@@ -3224,7 +3251,9 @@ function App() {
               
               <div style={{marginBottom: 16, padding: 12, background: '#e6f7ff', border: '1px solid #91d5ff', borderRadius: 4}}>
                 <div style={{fontSize: 12, color: '#0050b3', fontWeight: 500}}>
-                  ⓘ The mock service changes matched invoices to Posted after the server's day changes. No live OFIN posting occurs.
+                  {browserMatchDemo
+                    ? 'ⓘ The demo changes matched invoices to Posted after the browser’s local day changes. No live OFIN posting occurs.'
+                    : 'ⓘ The mock service changes matched invoices to Posted after the server’s day changes. No live OFIN posting occurs.'}
                 </div>
               </div>
               

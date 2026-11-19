@@ -32,6 +32,47 @@ export type MockMatchState = {
   matches: MockMatch[];
 };
 
+export const initialMatches: MockMatch[] = [
+  ...[
+    { orderNo: '6502411', receiptCounts: [1] },
+    { orderNo: '6502412', receiptCounts: [2] },
+    { orderNo: '6502413', receiptCounts: [2] },
+    { orderNo: '6502414', receiptCounts: [2] },
+    { orderNo: '6502415', receiptCounts: [1, 1] },
+    { orderNo: '6502416', receiptCounts: [1, 1] },
+    { orderNo: '6502417', receiptCounts: [1, 1] },
+    { orderNo: '6502420', receiptCounts: [1] },
+  ].flatMap(({ orderNo, receiptCounts }) =>
+    receiptCounts.map((count, index) => ({
+      orderNo,
+      invoiceIds: [`EX-${orderNo}-${index + 1}`],
+      receiptNos: Array.from({ length: count }, (_, receiptIndex) => `RCP-${orderNo}-${index + 1}-${receiptIndex + 1}`),
+      matchedAt: '2026-10-01T00:00:00.000Z',
+      status: 'Posted' as const,
+    })),
+  ),
+  {
+    orderNo: '6502401',
+    invoiceIds: ['IM-SAMPLE-11'],
+    receiptNos: ['RCP-SAMPLE-11'],
+    matchedAt: '2026-11-09T00:00:00.000Z',
+    status: 'Posted',
+  },
+];
+
+export type MatchRequest = {
+  orderNo: string;
+  invoiceIds: string[];
+  receiptNos: string[];
+  details: MatchDetails;
+};
+
+export const hasMatchConflict = (matches: MockMatch[], request: MatchRequest): boolean =>
+  matches.some(match =>
+    match.invoiceIds.some(id => request.invoiceIds.includes(id))
+    || (match.orderNo === request.orderNo && match.receiptNos.some(number => request.receiptNos.includes(number))),
+  );
+
 const isMatchResolution = (value: unknown): value is MatchResolution => {
   if (!value || typeof value !== 'object') return false;
   const choice = value as Record<string, unknown>;
