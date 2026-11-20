@@ -34,12 +34,23 @@ const postMatch = payload => fetch(endpoint, {
   body: JSON.stringify(payload),
 });
 
-test('historical matches retain their mapping without inventing resolution details', async () => {
+test('posted examples include match details and totals for each document group', async () => {
   const state = await (await fetch(endpoint)).json();
   const match = state.matches.find(item => item.invoiceIds.includes('EX-6502415-1'));
   assert.deepEqual(match.receiptNos, ['RCP-6502415-1-1']);
   assert.equal(match.status, 'Posted');
-  assert.equal(match.details, undefined);
+  assert.ok(state.matches.every(item => item.details?.matchedTotals));
+  const matching = state.matches.find(item => item.orderNo === '6502412');
+  assert.equal(matching.details.receiptQty, 100);
+  assert.deepEqual(matching.details.matchedTotals, { quantity: 100, amount: 10000 });
+  assert.deepEqual(matching.details.quantityResolution, {});
+  const example = state.matches.find(item => item.orderNo === '6502413');
+  assert.equal(example.details.quantityResolution.type, 'invoice');
+  assert.equal(example.details.costResolution.type, 'invoice');
+  assert.equal(example.details.invoiceQty - example.details.receiptQty, 3);
+  assert.equal(example.details.invoiceCost - example.details.receiptCost, 300);
+  assert.equal(example.details.finalInvoiceQty, 100);
+  assert.equal(example.details.finalInvoiceCost, 10000);
 });
 
 test('match details must be valid and identify the selected invoices', async () => {
@@ -57,6 +68,13 @@ test('match details must be valid and identify the selected invoices', async () 
     details: detailsFor('B'),
   });
   assert.equal(wrongInvoice.status, 400);
+  const invalidTotals = await postMatch({
+    orderNo: 'TEST-INVALID',
+    invoiceIds: ['A'],
+    receiptNos: ['R'],
+    details: { ...detailsFor('A'), matchedTotals: { quantity: 97, amount: '9700' } },
+  });
+  assert.equal(invalidTotals.status, 400);
 });
 
 test('competing matches reserve a receipt once and share the recorded decisions', async () => {

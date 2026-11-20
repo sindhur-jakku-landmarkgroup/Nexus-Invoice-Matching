@@ -1,4 +1,4 @@
-import { hasMatchConflict, initialMatches, isMockMatchState } from './mockMatches';
+import { hasMatchConflict, initialMatches, isMockMatchState, restoreSeedMatchDetails } from './mockMatches';
 import type { MatchRequest, MockMatchState } from './mockMatches';
 
 const storageKey = 'nexus-invoice-matching.demo-matches.v1';
@@ -27,7 +27,7 @@ const withState = async <T>(update: (state: MockMatchState) => T): Promise<T> =>
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    let updated = false;
+    let updated = restoreSeedMatchDetails(state.matches);
     state.matches.forEach(match => {
       if (match.status === 'Matched' && new Date(match.matchedAt).getTime() < today.getTime()) {
         match.status = 'Posted';

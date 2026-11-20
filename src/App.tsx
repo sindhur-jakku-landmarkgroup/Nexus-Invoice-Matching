@@ -1,4 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
 import {
   ArrowLeftOutlined,
   AuditOutlined,
@@ -8,7 +9,6 @@ import {
   DollarCircleOutlined,
   DownOutlined,
   DownloadOutlined,
-  ExclamationCircleFilled,
   FileSearchOutlined,
   FilterOutlined,
   InboxOutlined,
@@ -20,6 +20,7 @@ import {
   SettingOutlined,
   SwapOutlined,
   SyncOutlined,
+  UploadOutlined,
 } from '@ant-design/icons';
 import {
   Avatar,
@@ -27,6 +28,7 @@ import {
   Button,
   Card,
   Checkbox,
+  ConfigProvider,
   Descriptions,
   Divider,
   Input,
@@ -49,7 +51,10 @@ import {
 } from 'antd';
 import type { MenuProps, TableColumnsType } from 'antd';
 import { getBrowserMatches, saveBrowserMatch } from './browserMatches';
-import { isMockMatchState } from './mockMatches';
+import { createInvoiceDraftItem, getInvoiceItemAmount, getInvoiceItemTotals, invoiceFinancialsChanged, reconcileInvoiceLines, validateInvoiceItems } from './invoiceItems';
+import type { InvoiceDraftItem } from './invoiceItems';
+import { exportInvoiceItemsCsv, importInvoiceItemsCsv } from './invoiceItemsCsv';
+import { getCurrentMatchComparison, getMatchedTotals, isMockMatchState } from './mockMatches';
 import type { MatchDetails, MatchResolution, MockMatch, MockMatchState } from './mockMatches';
 
 const noteMemoTypes = [
@@ -71,12 +76,22 @@ type InvoiceType = 'CDC' | 'CFS' | 'RDC' | 'Local' | 'DSD' | 'Direct' | NoteMemo
 const isNoteMemo = (type: InvoiceType): type is NoteMemoType => noteMemoTypes.some(item => item === type);
 const noteMemoTypeLabel = (type: NoteMemoType) => type === 'Credit note' ? 'Credit Note' : type;
 
+type ReceiptItem = {
+  item: string;
+  description: string;
+  quantity: number;
+  unitCost: number;
+  amount: number;
+};
+
 type Receipt = {
   receiptNo: string;
   date: string;
   location: string;
   quantity: number;
   amount: number;
+  currency: string;
+  items: ReceiptItem[];
 };
 
 type InvoiceLine = {
@@ -94,6 +109,7 @@ type ResolutionDraft = MatchResolution;
 
 type OrderResolution = {
   snapshot: string;
+  isAggregate: boolean;
   quantity: ResolutionDraft;
   cost: ResolutionDraft;
   originalInvoice?: Invoice;
@@ -144,7 +160,7 @@ type InvoiceDraft = {
   orderNo: string;
   location: string;
   currency: string;
-  exchangeRate: number;
+  exchangeRate: number | null;
   invoiceDate: string;
   matchDate: string;
   dueDate: string;
@@ -153,19 +169,18 @@ type InvoiceDraft = {
   supplierTerms: string;
   freightPaymentType: string;
   paymentHoldStatus: string;
-  ediInvoice: boolean;
-  prePaid: boolean;
-  manuallyPaid: boolean;
-  detailsAttached: boolean;
-  consignment: boolean;
-  directStoreDelivery: boolean;
-  evaluatedReceiptSettlement: boolean;
-  costExTax: number;
-  nonMerchCostExTax: number;
+  ediInvoice: boolean | null;
+  prePaid: boolean | null;
+  manuallyPaid: boolean | null;
+  detailsAttached: boolean | null;
+  consignment: boolean | null;
+  directStoreDelivery: boolean | null;
+  evaluatedReceiptSettlement: boolean | null;
+  nonMerchCostExTax: number | null;
   taxCode: string;
-  taxRate: number;
-  invoiceQty: number;
-  allowances: number;
+  taxRate: number | null;
+  items: InvoiceDraftItem[];
+  allowances: number | null;
   refNo1: string;
   refNo2: string;
   refNo3: string;
@@ -221,11 +236,10 @@ const emptyInvoiceDraft: InvoiceDraft = {
   consignment: false,
   directStoreDelivery: false,
   evaluatedReceiptSettlement: false,
-  costExTax: 0,
   nonMerchCostExTax: 0,
   taxCode: 'OMSTD',
   taxRate: 5,
-  invoiceQty: 0,
+  items: [],
   allowances: 0,
   refNo1: '',
   refNo2: '',
@@ -262,6 +276,7 @@ type Invoice = {
   manualCreation?: boolean;
   reimCreationEligible?: boolean;
   legacyDetails?: LegacyInvoiceDetails;
+  maintenance?: InvoiceDraft;
   quantityResolution?: ResolutionChoice;
   costResolution?: ResolutionChoice;
   noteMemoDetails?: { location: string; requestReference: string; comment: string };
@@ -296,6 +311,14 @@ const makeMatchingExample = (
       date: invoiceDate,
       location: 'Sharjah DC',
       ...receipt,
+      currency: 'AED',
+      items: [{
+        item: `EX-${orderNo}-${invoiceNumber}`,
+        description: 'Illustrative merchandise',
+        quantity: receipt.quantity,
+        unitCost: receipt.amount / receipt.quantity,
+        amount: receipt.amount,
+      }],
     })),
     lines: [{
       item: `EX-${orderNo}-${invoiceNumber}`,
@@ -311,7 +334,7 @@ const makeMatchingExample = (
   };
 });
 
-const initialInvoices: Invoice[] = [
+export const initialInvoices: Invoice[] = [
   {
     id: 'IM-1038',
     invoiceNo: 'INV-260374',
@@ -329,7 +352,10 @@ const initialInvoices: Invoice[] = [
     exampleLabel: 'One invoice and one matching receipt',
     source: 'RMS Mass Upload · MU-8241',
     initials: 'MH',
-    receipts: [{ receiptNo: 'RCP-723505', date: '09 Nov 2026', location: 'Sharjah DC', quantity: 840, amount: 15780 }],
+    receipts: [{
+      receiptNo: 'RCP-723505', date: '09 Nov 2026', location: 'Sharjah DC', quantity: 840, amount: 15780, currency: 'AED',
+      items: [{ item: 'GF-104841', description: 'Ambient grocery assortment', quantity: 840, unitCost: 15780 / 840, amount: 15780 }],
+    }],
     lines: [{ item: 'GF-104841', description: 'Ambient grocery assortment', invoiceQty: 840, receiptQty: 840, unitCost: 18.7857, tax: '5%' }],
     taxResolved: true,
     tolerance: 0,
@@ -355,8 +381,14 @@ const initialInvoices: Invoice[] = [
     source: 'STS job · STP-99821',
     initials: 'GS',
     receipts: [
-      { receiptNo: 'RCP-723842', date: '09 Nov 2026', location: 'Dubai DC', quantity: 320, amount: 23872 },
-      { receiptNo: 'RCP-724091', date: '10 Nov 2026', location: 'Dubai DC', quantity: 325, amount: 24244.4 },
+      {
+        receiptNo: 'RCP-723842', date: '09 Nov 2026', location: 'Dubai DC', quantity: 320, amount: 23872, currency: 'AED',
+        items: [{ item: 'HC-880142', description: 'Cotton duvet set, king', quantity: 320, unitCost: 74.6, amount: 23872 }],
+      },
+      {
+        receiptNo: 'RCP-724091', date: '10 Nov 2026', location: 'Dubai DC', quantity: 325, amount: 24244.4, currency: 'AED',
+        items: [{ item: 'HC-880316', description: 'Percale pillow pair', quantity: 325, unitCost: 24244.4 / 325, amount: 24244.4 }],
+      },
     ],
     lines: [
       { item: 'HC-880142', description: 'Cotton duvet set, king', invoiceQty: 320, receiptQty: 320, unitCost: 74.6, tax: '5%' },
@@ -383,8 +415,20 @@ const initialInvoices: Invoice[] = [
     source: 'Sample invoice',
     initials: 'RH',
     receipts: [
-      { receiptNo: 'RCP-724100', date: '09 Nov 2026', location: 'Dubai DC', quantity: 50, amount: 4800 },
-      { receiptNo: 'RCP-724101', date: '10 Nov 2026', location: 'Dubai DC', quantity: 50, amount: 4600 },
+      {
+        receiptNo: 'RCP-724100', date: '09 Nov 2026', location: 'Dubai DC', quantity: 50, amount: 4800, currency: 'AED',
+        items: [
+          { item: 'RH-100100', description: 'Sample merchandise A', quantity: 25, unitCost: 96, amount: 2400 },
+          { item: 'RH-100101', description: 'Sample merchandise B', quantity: 25, unitCost: 96, amount: 2400 },
+        ],
+      },
+      {
+        receiptNo: 'RCP-724101', date: '10 Nov 2026', location: 'Dubai DC', quantity: 50, amount: 4600, currency: 'AED',
+        items: [
+          { item: 'RH-100100', description: 'Sample merchandise A', quantity: 25, unitCost: 92, amount: 2300 },
+          { item: 'RH-100101', description: 'Sample merchandise B', quantity: 25, unitCost: 92, amount: 2300 },
+        ],
+      },
     ],
     lines: [
       { item: 'RH-100100', description: 'Sample merchandise A', invoiceQty: 50, receiptQty: 50, unitCost: 100, tax: '5%' },
@@ -474,7 +518,10 @@ const initialInvoices: Invoice[] = [
     status: 'Ready to Match',
     source: 'Local AP invoice · source integration',
     initials: 'VZ',
-    receipts: [{ receiptNo: 'RCP-722988', date: '08 Nov 2026', location: 'Abu Dhabi store', quantity: 98, amount: 12201 }],
+    receipts: [{
+      receiptNo: 'RCP-722988', date: '08 Nov 2026', location: 'Abu Dhabi store', quantity: 98, amount: 12201, currency: 'AED',
+      items: [{ item: 'TX-442190', description: 'Hotel collection bath towel', quantity: 98, unitCost: 124.5, amount: 12201 }],
+    }],
     lines: [{ item: 'TX-442190', description: 'Hotel collection bath towel', invoiceQty: 100, receiptQty: 98, unitCost: 126.54, tax: '5%' }],
     taxResolved: true,
     tolerance: 2,
@@ -497,7 +544,10 @@ const initialInvoices: Invoice[] = [
     status: 'Ready to Match',
     source: 'Invoice and receipt comparison',
     initials: 'CM',
-    receipts: [{ receiptNo: 'RCP-722140', date: '04 Nov 2026', location: 'Dubai DC', quantity: 100, amount: 4800 }],
+    receipts: [{
+      receiptNo: 'RCP-722140', date: '04 Nov 2026', location: 'Dubai DC', quantity: 100, amount: 4800, currency: 'AED',
+      items: [{ item: 'NS-400220', description: 'Bath towel set', quantity: 100, unitCost: 48, amount: 4800 }],
+    }],
     lines: [{ item: 'NS-400220', description: 'Bath towel set', invoiceQty: 105, receiptQty: 100, unitCost: 50, receiptUnitCost: 48, tax: '0%' }],
     taxResolved: true,
     tolerance: 5,
@@ -521,7 +571,10 @@ const initialInvoices: Invoice[] = [
     hasException: true,
     source: 'Invoice and receipt comparison',
     initials: 'RH',
-    receipts: [{ receiptNo: 'RCP-721994', date: '03 Nov 2026', location: 'Sharjah DC', quantity: 100, amount: 4800 }],
+    receipts: [{
+      receiptNo: 'RCP-721994', date: '03 Nov 2026', location: 'Sharjah DC', quantity: 100, amount: 4800, currency: 'AED',
+      items: [{ item: 'CL-390114', description: 'Living room storage unit', quantity: 100, unitCost: 48, amount: 4800 }],
+    }],
     lines: [{ item: 'CL-390114', description: 'Living room storage unit', invoiceQty: 115, receiptQty: 100, unitCost: 55, receiptUnitCost: 48, tax: '0%' }],
     taxResolved: true,
     tolerance: 5,
@@ -567,7 +620,10 @@ const initialInvoices: Invoice[] = [
     hasException: true,
     source: 'RPA exception report · EX-1208',
     initials: 'HP',
-    receipts: [{ receiptNo: 'RCP-721901', date: '31 Oct 2026', location: 'Riyadh DC', quantity: 55, amount: 7628 }],
+    receipts: [{
+      receiptNo: 'RCP-721901', date: '31 Oct 2026', location: 'Riyadh DC', quantity: 55, amount: 7628, currency: 'AED',
+      items: [{ item: 'RD-113005', description: 'Direct shipment assortment', quantity: 55, unitCost: 7628 / 55, amount: 7628 }],
+    }],
     lines: [{ item: 'RD-113005', description: 'Direct shipment assortment', invoiceQty: 59, receiptQty: 55, unitCost: 138.57, tax: '5%' }],
     taxResolved: true,
     tolerance: 0,
@@ -610,7 +666,10 @@ const initialInvoices: Invoice[] = [
     hasException: true,
     source: 'STS/STPS job missing · accrued liability pending',
     initials: 'XB',
-    receipts: [{ receiptNo: 'RCP-721220', date: '29 Oct 2026', location: 'Dubai DC', quantity: 120, amount: 9420 }],
+    receipts: [{
+      receiptNo: 'RCP-721220', date: '29 Oct 2026', location: 'Dubai DC', quantity: 120, amount: 9420, currency: 'AED',
+      items: [{ item: 'AU-615200', description: 'Decorative home assortment', quantity: 120, unitCost: 78.5, amount: 9420 }],
+    }],
     lines: [{ item: 'AU-615200', description: 'Decorative home assortment', invoiceQty: 120, receiptQty: 120, unitCost: 78.5, tax: '5%' }],
     taxResolved: true,
     tolerance: 0,
@@ -632,7 +691,10 @@ const initialInvoices: Invoice[] = [
     status: 'Ready to Match',
     source: 'Sample invoice',
     initials: 'GH',
-    receipts: [{ receiptNo: 'RCP-SAMPLE-10', date: '09 Nov 2026', location: 'Dubai DC', quantity: 100, amount: 5000 }],
+    receipts: [{
+      receiptNo: 'RCP-SAMPLE-10', date: '09 Nov 2026', location: 'Dubai DC', quantity: 100, amount: 5000, currency: 'AED',
+      items: [{ item: 'SAMPLE-10', description: 'Sample merchandise', quantity: 100, unitCost: 50, amount: 5000 }],
+    }],
     lines: [{ item: 'SAMPLE-10', description: 'Sample merchandise', invoiceQty: 100, receiptQty: 100, unitCost: 50, tax: '5%' }],
     taxResolved: true,
     tolerance: 0,
@@ -653,7 +715,10 @@ const initialInvoices: Invoice[] = [
     status: 'Posted',
     source: 'Sample invoice · posted after matching',
     initials: 'BH',
-    receipts: [{ receiptNo: 'RCP-SAMPLE-11', date: '09 Nov 2026', location: 'Dubai DC', quantity: 60, amount: 3000 }],
+    receipts: [{
+      receiptNo: 'RCP-SAMPLE-11', date: '09 Nov 2026', location: 'Dubai DC', quantity: 60, amount: 3000, currency: 'AED',
+      items: [{ item: 'SAMPLE-11', description: 'Sample merchandise', quantity: 60, unitCost: 50, amount: 3000 }],
+    }],
     lines: [{ item: 'SAMPLE-11', description: 'Sample merchandise', invoiceQty: 60, receiptQty: 60, unitCost: 50, tax: '5%' }],
     taxResolved: true,
     tolerance: 0,
@@ -789,13 +854,71 @@ const legacyTaxCodes = [
 const money = (value: number, currency = 'AED') =>
   new Intl.NumberFormat('en-AE', { style: 'currency', currency, maximumFractionDigits: 2 }).format(value);
 
+const unitMoney = (value: number, currency: string) =>
+  new Intl.NumberFormat('en-AE', { style: 'currency', currency, maximumFractionDigits: 4 }).format(value);
+
+const invoiceDateInput = (date: string) => {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+  const parsed = new Date(date);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`;
+};
+
+const invoiceToDraft = (invoice: Invoice): InvoiceDraft => {
+  if (isNoteMemo(invoice.type)) throw new Error('Notes and memos cannot be edited as invoices.');
+  const legacy = invoice.legacyDetails;
+  const stored = invoice.maintenance;
+  return {
+    ...emptyInvoiceDraft,
+    documentType: stored?.documentType ?? legacy?.documentType ?? 'Merchandise Invoice',
+    invoiceNo: invoice.invoiceNo,
+    type: invoice.type,
+    groupId: stored?.groupId ?? legacy?.groupId ?? '',
+    vendorType: stored?.vendorType ?? '',
+    supplierSite: invoice.supplierSiteNo ?? legacy?.supplierSite ?? '',
+    supplierSiteName: invoice.supplierSiteName ?? '',
+    orderNo: invoice.orderNo,
+    location: stored?.location ?? legacy?.location ?? '',
+    currency: invoice.currency,
+    exchangeRate: stored?.exchangeRate ?? (legacy ? Number(legacy.exchangeRate) : null),
+    invoiceDate: invoiceDateInput(invoice.invoiceDate),
+    matchDate: stored?.matchDate || (invoice.matchedAt ? invoiceDateInput(invoice.matchedAt) : ''),
+    dueDate: stored?.dueDate ?? (legacy ? invoiceDateInput(legacy.dueDate) : ''),
+    invoiceTerms: stored?.invoiceTerms ?? legacy?.invoiceTerms ?? '',
+    orderTerms: stored?.orderTerms ?? legacy?.orderTerms ?? '',
+    supplierTerms: stored?.supplierTerms ?? legacy?.supplierTerms ?? '',
+    freightPaymentType: stored?.freightPaymentType ?? '',
+    paymentHoldStatus: stored?.paymentHoldStatus ?? legacy?.paymentHoldStatus ?? '',
+    ediInvoice: stored?.ediInvoice ?? null,
+    prePaid: stored?.prePaid ?? null,
+    manuallyPaid: stored?.manuallyPaid ?? null,
+    detailsAttached: stored?.detailsAttached ?? legacy?.detailsAttached ?? null,
+    consignment: stored?.consignment ?? null,
+    directStoreDelivery: stored?.directStoreDelivery ?? null,
+    evaluatedReceiptSettlement: stored?.evaluatedReceiptSettlement ?? null,
+    nonMerchCostExTax: stored?.nonMerchCostExTax ?? legacy?.nonMerchCostExTax ?? null,
+    taxCode: stored?.taxCode ?? legacy?.taxCode ?? '',
+    taxRate: stored?.taxRate ?? legacy?.taxRate ?? null,
+    items: invoice.lines.map((line, index) => ({
+      id: stored?.items[index]?.id ?? crypto.randomUUID(),
+      item: line.item,
+      description: line.description,
+      quantity: line.invoiceQty,
+      unitCost: line.unitCost,
+    })),
+    allowances: stored?.allowances ?? legacy?.allowances ?? null,
+    refNo1: stored?.refNo1 ?? legacy?.reference ?? '',
+    refNo2: stored?.refNo2 ?? '',
+    refNo3: stored?.refNo3 ?? '',
+    refNo4: stored?.refNo4 ?? '',
+  };
+};
+
 const navigationItems: MenuProps['items'] = [
-  { key: 'dashboard', icon: <HomeOutlined />, label: 'Dashboard' },
   { key: 'services', icon: <HomeOutlined />, label: 'All Services' },
   { key: 'classic', icon: <DollarCircleOutlined />, label: 'Open RMS Classic' },
   { type: 'divider' },
   { key: 'matching', icon: <SwapOutlined />, label: 'Invoice matching' },
-  { key: 'exceptions', icon: <ExclamationCircleFilled />, label: 'Exception work' },
   { key: 'reports', icon: <AuditOutlined />, label: 'Reports' },
 ];
 
@@ -809,15 +932,24 @@ function App() {
   const [selectedReceipts, setSelectedReceipts] = useState<Record<string, string[]>>({});
   const [filter, setFilter] = useState('All invoices');
   const [query, setQuery] = useState('');
-  const [activeNav, setActiveNav] = useState('matching');
   const [activeTab, setActiveTab] = useState('matching');
   const [mobileView, setMobileView] = useState<'queue' | 'detail'>('queue');
   const [taxBreakdownOpen, setTaxBreakdownOpen] = useState(false);
   const [reimCreateOpen, setReimCreateOpen] = useState(false);
   const [invoiceDraft, setInvoiceDraft] = useState<InvoiceDraft>(emptyInvoiceDraft);
+  const [detailDraftBaseline, setDetailDraftBaseline] = useState<InvoiceDraft | null>(null);
+  const [editingInvoice, setEditingInvoice] = useState(false);
+  const [savingInvoice, setSavingInvoice] = useState(false);
+  const invoicesRef = useRef(invoices);
+  invoicesRef.current = invoices;
+  const detailInvoiceAtOpen = useRef<Invoice | null>(null);
+  const [pendingInvoiceItems, setPendingInvoiceItems] = useState<InvoiceDraftItem[] | null>(null);
+  const invoiceItemsFileRef = useRef<HTMLInputElement>(null);
+  const invoiceItemsReadId = useRef(0);
   const [creditNoteCreateOpen, setCreditNoteCreateOpen] = useState(false);
   const [creditNoteDraft, setCreditNoteDraft] = useState<CreditNoteDraft>(emptyCreditNoteDraft);
   const [taxEditorOpen, setTaxEditorOpen] = useState(false);
+  const taxEditorOriginal = useRef<{ taxCode: string; taxRate: number | null } | null>(null);
   const [localRuleApplied, setLocalRuleApplied] = useState(false);
   const [resolveDiscrepancyOpen, setResolveDiscrepancyOpen] = useState(false);
   const [resolutionTarget, setResolutionTarget] = useState<ResolutionTarget | null>(null);
@@ -894,7 +1026,7 @@ function App() {
   const [invoiceDetailOpen, setInvoiceDetailOpen] = useState(false);
   const [receiptDetailOpen, setReceiptDetailOpen] = useState(false);
   const [detailInvoiceId, setDetailInvoiceId] = useState<string>('');
-  const [detailReceiptNo, setDetailReceiptNo] = useState<string>('');
+  const [detailReceiptKey, setDetailReceiptKey] = useState<{ orderNo: string; receiptNo: string } | null>(null);
 
   const [reportOpen, setReportOpen] = useState(false);
   const [reportOrderNo, setReportOrderNo] = useState('');
@@ -1326,6 +1458,7 @@ function App() {
       ...current,
       [orderNo]: {
         snapshot: getResolutionSnapshot(orderNo, updatedInvoices),
+        isAggregate: resolutionIsAggregate,
         quantity: quantityResolution,
         cost: costResolution,
         originalInvoice: activeOrderResolution?.originalInvoice ?? (resolutionIsAggregate ? undefined : resolutionInvoice),
@@ -1345,9 +1478,86 @@ function App() {
   };
 
   const openReimCreate = () => {
-    setInvoiceDraft(emptyInvoiceDraft);
+    invoiceItemsReadId.current += 1;
+    setPendingInvoiceItems(null);
+    setInvoiceDraft({ ...emptyInvoiceDraft, items: [createInvoiceDraftItem()] });
+    setDetailDraftBaseline(null);
+    setEditingInvoice(false);
+    detailInvoiceAtOpen.current = null;
     setTaxEditorOpen(false);
     setReimCreateOpen(true);
+  };
+
+  const openInvoiceDetails = (invoice: Invoice) => {
+    if (isNoteMemo(invoice.type)) {
+      setDetailInvoiceId(invoice.id);
+      setInvoiceDetailOpen(true);
+      return;
+    }
+    invoiceItemsReadId.current += 1;
+    setPendingInvoiceItems(null);
+    const draft = invoiceToDraft(invoice);
+    detailInvoiceAtOpen.current = invoice;
+    setDetailInvoiceId(invoice.id);
+    setInvoiceDraft(draft);
+    setDetailDraftBaseline(draft);
+    setEditingInvoice(false);
+    setTaxEditorOpen(false);
+    setReimCreateOpen(true);
+  };
+
+  const closeReimCreate = () => {
+    if (savingInvoice) return;
+    invoiceItemsReadId.current += 1;
+    setPendingInvoiceItems(null);
+    setTaxEditorOpen(false);
+    setReimCreateOpen(false);
+  };
+
+  const downloadInvoiceItems = () => {
+    const result = exportInvoiceItemsCsv(invoiceDraft.items);
+    if ('error' in result) {
+      messageApi.error(result.error);
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([result.csv], { type: 'text/csv;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'invoice-items.csv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const uploadInvoiceItems = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const readId = ++invoiceItemsReadId.current;
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      messageApi.error('Choose a CSV file.');
+      return;
+    }
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+    } catch {
+      if (readId === invoiceItemsReadId.current) messageApi.error('Unable to read the file. Choose a UTF-8 CSV file.');
+      return;
+    }
+    if (readId !== invoiceItemsReadId.current) return;
+    const result = importInvoiceItemsCsv(text);
+    if ('error' in result) {
+      messageApi.error(result.error);
+      return;
+    }
+    setPendingInvoiceItems(result.items);
+  };
+
+  const updateInvoiceDraftItem = (id: string, changes: Partial<Omit<InvoiceDraftItem, 'id'>>) => {
+    setInvoiceDraft(current => ({
+      ...current,
+      items: current.items.map(item => item.id === id ? { ...item, ...changes } : item),
+    }));
   };
 
   const openCreditNoteCreate = () => {
@@ -1413,7 +1623,13 @@ function App() {
   };
 
   const handleCreateReimInvoice = () => {
-    const totalExTax = invoiceDraft.costExTax + invoiceDraft.nonMerchCostExTax;
+    const itemError = validateInvoiceItems(invoiceDraft.items);
+    const itemTotals = getInvoiceItemTotals(invoiceDraft.items);
+    if (invoiceDraft.nonMerchCostExTax === null || invoiceDraft.taxRate === null || invoiceDraft.allowances === null) {
+      messageApi.warning('Enter non-merchandise cost and allowances, and select a tax code.');
+      return;
+    }
+    const totalExTax = itemTotals.merchandiseCost + invoiceDraft.nonMerchCostExTax;
     const taxCost = Number((totalExTax * invoiceDraft.taxRate / 100).toFixed(2));
     const invoiceAmount = Number((totalExTax + taxCost - invoiceDraft.allowances).toFixed(2));
     const missingFields = [
@@ -1427,7 +1643,19 @@ function App() {
       messageApi.warning(`Complete the required fields: ${missingFields.join(', ')}.`);
       return;
     }
-    if (totalExTax <= 0 || invoiceDraft.invoiceQty <= 0 || invoiceAmount <= 0) {
+    if (itemError) {
+      messageApi.warning(itemError);
+      return;
+    }
+    const items = invoiceDraft.items.filter(
+      (item): item is InvoiceDraftItem & { quantity: number; unitCost: number } =>
+        item.quantity !== null && item.unitCost !== null,
+    );
+    if (items.length !== invoiceDraft.items.length) {
+      messageApi.error('Invoice item details are incomplete.');
+      return;
+    }
+    if (!Number.isFinite(totalExTax) || !Number.isFinite(invoiceAmount) || totalExTax <= 0 || invoiceAmount <= 0) {
       messageApi.warning('Enter a positive cost and invoice quantity before creating the invoice.');
       return;
     }
@@ -1448,16 +1676,17 @@ function App() {
       source: 'Created in ReIM',
       initials: invoiceDraft.supplierSiteName.trim().slice(0, 2).toUpperCase(),
       receipts: [],
-      lines: [{
-        item: 'INVOICE-LINE',
-        description: 'Invoice line pending receipt match',
-        invoiceQty: invoiceDraft.invoiceQty,
+      lines: items.map(item => ({
+        item: item.item.trim(),
+        description: item.description.trim(),
+        invoiceQty: item.quantity,
         receiptQty: 0,
-        unitCost: Number((totalExTax / invoiceDraft.invoiceQty).toFixed(2)),
+        unitCost: item.unitCost,
         tax: `${invoiceDraft.taxRate}%`,
-      }],
+      })),
       taxResolved: true,
       tolerance: 0,
+      maintenance: invoiceDraft,
     };
     setInvoices(current => [newInvoice, ...current]);
     setOrderPage(1);
@@ -1465,8 +1694,136 @@ function App() {
     setActiveTab('matching');
     setLocalRuleApplied(false);
     setMobileView('detail');
-    setReimCreateOpen(false);
+    closeReimCreate();
     messageApi.success('Invoice created in ReIM and added to the matching queue.');
+  };
+
+  const handleSaveInvoice = async () => {
+    const original = detailInvoiceAtOpen.current;
+    if (!original || !detailDraftBaseline || savingInvoice) return;
+    const financialChanged = invoiceFinancialsChanged(detailDraftBaseline, invoiceDraft);
+    const itemsChanged = JSON.stringify(detailDraftBaseline.items) !== JSON.stringify(invoiceDraft.items);
+    const missingFields = [
+      !invoiceDraft.invoiceNo.trim() && 'invoice number',
+      !invoiceDraft.supplierSite.trim() && 'supplier site number',
+      !invoiceDraft.supplierSiteName.trim() && 'supplier site name',
+      !invoiceDraft.invoiceDate && 'invoice date',
+    ].filter(Boolean);
+    if (missingFields.length) {
+      messageApi.warning(`Complete the required fields: ${missingFields.join(', ')}.`);
+      return;
+    }
+    const itemError = itemsChanged || financialChanged ? validateInvoiceItems(invoiceDraft.items) : undefined;
+    if (itemError) {
+      messageApi.warning(itemError);
+      return;
+    }
+    if (financialChanged && (invoiceDraft.nonMerchCostExTax === null || invoiceDraft.allowances === null || invoiceDraft.taxRate === null)) {
+      messageApi.warning('Enter non-merchandise cost and allowances, and select a tax code to recalculate the invoice total.');
+      return;
+    }
+    const itemTotals = getInvoiceItemTotals(invoiceDraft.items);
+    const exTax = itemTotals.merchandiseCost + (invoiceDraft.nonMerchCostExTax ?? 0);
+    const amount = Number((exTax + Number((exTax * (invoiceDraft.taxRate ?? 0) / 100).toFixed(2)) - (invoiceDraft.allowances ?? 0)).toFixed(2));
+    if (financialChanged && (!Number.isFinite(amount) || exTax <= 0 || amount <= 0)) {
+      messageApi.warning('Enter a positive cost and invoice quantity before saving.');
+      return;
+    }
+    setSavingInvoice(true);
+    try {
+      let state: MockMatchState;
+      if (browserMatchDemo) {
+        state = await getBrowserMatches();
+      } else {
+        const response = await fetch('/api/mock/matches', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
+        const result: unknown = await response.json();
+        if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
+        state = result;
+      }
+      updateMatchState(state);
+      const current = invoicesRef.current.find(invoice => invoice.id === original.id);
+      if (!current || current.status !== 'Ready to Match' || state.matches.some(match => match.invoiceIds.includes(original.id))) {
+        messageApi.warning('This invoice is matched or no longer available and cannot be edited.');
+        const savedDraft = current ? invoiceToDraft(current) : detailDraftBaseline;
+        setInvoiceDraft(savedDraft);
+        setDetailDraftBaseline(savedDraft);
+        setEditingInvoice(false);
+        return;
+      }
+      if (current !== original) {
+        messageApi.warning('This invoice changed while you were editing. Close and reopen its details.');
+        return;
+      }
+      if (JSON.stringify(invoiceDraft) === JSON.stringify(detailDraftBaseline)) {
+        setEditingInvoice(false);
+        messageApi.info('No changes to save.');
+        return;
+      }
+      const lines = itemsChanged || invoiceDraft.taxRate !== detailDraftBaseline.taxRate
+        ? reconcileInvoiceLines(detailDraftBaseline.items, current.lines, invoiceDraft.items, (item, previous) => ({
+          item: item.item.trim(),
+          description: item.description.trim(),
+          invoiceQty: item.quantity ?? 0,
+          receiptQty: previous?.receiptQty ?? 0,
+          unitCost: item.unitCost ?? 0,
+          receiptUnitCost: previous?.receiptUnitCost,
+          tax: invoiceDraft.taxRate !== detailDraftBaseline.taxRate ? `${invoiceDraft.taxRate}%` : previous?.tax ?? (invoiceDraft.taxRate === null ? '' : `${invoiceDraft.taxRate}%`),
+        }))
+        : current.lines;
+      const updated: Invoice = {
+        ...current,
+        invoiceNo: invoiceDraft.invoiceNo.trim(),
+        supplierSiteNo: invoiceDraft.supplierSite.trim(),
+        supplierSiteName: invoiceDraft.supplierSiteName.trim(),
+        type: invoiceDraft.type,
+        invoiceDate: new Date(`${invoiceDraft.invoiceDate}T00:00:00`).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
+        currency: invoiceDraft.currency,
+        amount: financialChanged ? amount : current.amount,
+        lines,
+        maintenance: invoiceDraft,
+        legacyDetails: current.legacyDetails ? {
+          ...current.legacyDetails,
+          groupId: invoiceDraft.groupId,
+          supplierSite: invoiceDraft.supplierSite,
+          location: invoiceDraft.location,
+          dueDate: invoiceDraft.dueDate,
+          invoiceTerms: invoiceDraft.invoiceTerms,
+          orderTerms: invoiceDraft.orderTerms,
+          supplierTerms: invoiceDraft.supplierTerms,
+          exchangeRate: invoiceDraft.exchangeRate?.toString() ?? '',
+          detailsAttached: invoiceDraft.detailsAttached ?? current.legacyDetails.detailsAttached,
+          reference: invoiceDraft.refNo1,
+          taxCode: invoiceDraft.taxCode,
+          ...(financialChanged ? {
+            costExTax: itemTotals.merchandiseCost,
+            nonMerchCostExTax: invoiceDraft.nonMerchCostExTax ?? 0,
+            taxCost: Number((exTax * (invoiceDraft.taxRate ?? 0) / 100).toFixed(2)),
+            costIncTax: amount,
+            invoiceQty: itemTotals.quantity,
+            allowances: invoiceDraft.allowances ?? 0,
+            taxCode: invoiceDraft.taxCode,
+            taxRate: invoiceDraft.taxRate ?? 0,
+          } : {}),
+        } : undefined,
+        quantityResolution: undefined,
+        costResolution: undefined,
+      };
+      setInvoices(list => list.map(invoice => invoice.id === updated.id ? updated : invoice));
+      setOrderResolutions(currentResolutions => {
+        const next = { ...currentResolutions };
+        delete next[current.orderNo];
+        return next;
+      });
+      detailInvoiceAtOpen.current = updated;
+      setDetailDraftBaseline(invoiceDraft);
+      setEditingInvoice(false);
+      messageApi.success('Invoice changes saved.');
+    } catch (error) {
+      messageApi.error(`Invoice was not saved: ${error instanceof Error ? error.message : 'Unable to reach the match service.'}`);
+    } finally {
+      setSavingInvoice(false);
+    }
   };
 
   const handleExport = () => {
@@ -1597,6 +1954,12 @@ function App() {
       quantityResolution: savedResolution?.quantity ?? {},
       costResolution: savedResolution?.cost ?? {},
     };
+    const matchedTotals = getMatchedTotals(details, savedResolution?.isAggregate ? 'aggregate' : 'unit');
+    if (matchedTotals.quantity === undefined || matchedTotals.amount === undefined) {
+      messageApi.error('Unable to determine matched totals. Review the resolution choices.');
+      return;
+    }
+    details.matchedTotals = { quantity: matchedTotals.quantity, amount: matchedTotals.amount };
     setPostingOrderNo(orderNo);
     setPostingConfirmationOpen(false);
     setPostingProgressOpen(true);
@@ -1663,9 +2026,21 @@ function App() {
   const pendingInvoices = readyToMatch + matchedToday;
   const unpostedNotesAndMemos = invoices.filter(invoice => isNoteMemo(invoice.type) && invoice.status !== 'Posted').length;
 
+  const clearWorkbenchFilters = () => {
+    setOrderFilter('');
+    setSupplierSiteFilter('');
+    setDocumentFilter('');
+    setStatusFilter('');
+    setOrderPage(1);
+  };
+
   const handleNav = (key: string) => {
-    setActiveNav(key);
-    if (key !== 'matching') messageApi.info('This prototype focuses on the invoice matching workbench.');
+    if (key !== 'matching') return;
+    clearWorkbenchFilters();
+    setOrderPageSize(10);
+    setActiveTab('matching');
+    setMobileView('queue');
+    window.scrollTo({ top: 0 });
   };
 
   // Check if any selected receipt has variance
@@ -1747,9 +2122,26 @@ function App() {
     ?? 'Not available';
   const invoiceDocumentType = selectedInvoice.legacyDetails?.documentType
     ?? (isNoteMemo(selectedInvoice.type) ? noteMemoTypeLabel(selectedInvoice.type) : 'Merchandise Invoice');
-  const totalExTax = invoiceDraft.costExTax + invoiceDraft.nonMerchCostExTax;
-  const draftTaxCost = Number((totalExTax * invoiceDraft.taxRate / 100).toFixed(2));
-  const totalInvoiceCost = Number((totalExTax + draftTaxCost - invoiceDraft.allowances).toFixed(2));
+  const draftItemTotals = getInvoiceItemTotals(invoiceDraft.items);
+  const detailInvoice = detailDraftBaseline ? invoices.find(invoice => invoice.id === detailInvoiceId) : undefined;
+  const detailReadOnly = !!detailDraftBaseline && !editingInvoice;
+  const financialChanged = detailDraftBaseline ? invoiceFinancialsChanged(detailDraftBaseline, invoiceDraft) : true;
+  const totalExTax = invoiceDraft.nonMerchCostExTax === null ? null : draftItemTotals.merchandiseCost + invoiceDraft.nonMerchCostExTax;
+  const draftTaxCost = totalExTax === null || invoiceDraft.taxRate === null ? null : Number((totalExTax * invoiceDraft.taxRate / 100).toFixed(2));
+  const totalInvoiceCost = totalExTax === null || draftTaxCost === null || invoiceDraft.allowances === null
+    ? null : Number((totalExTax + draftTaxCost - invoiceDraft.allowances).toFixed(2));
+  useEffect(() => {
+    if (!editingInvoice || !detailInvoice || !detailDraftBaseline) return;
+    if (detailInvoice.status === 'Ready to Match' && !matchState?.matches.some(match => match.invoiceIds.includes(detailInvoice.id))) return;
+    const savedDraft = invoiceToDraft(detailInvoice);
+    invoiceItemsReadId.current += 1;
+    setPendingInvoiceItems(null);
+    setTaxEditorOpen(false);
+    setInvoiceDraft(savedDraft);
+    setDetailDraftBaseline(savedDraft);
+    setEditingInvoice(false);
+    messageApi.warning('This invoice is matched and can no longer be edited.');
+  }, [editingInvoice, detailInvoice, detailDraftBaseline, matchState, messageApi]);
   const creditNoteOrder = invoices.find(invoice => invoice.id === creditNoteDraft.orderInvoiceId);
   const creditNoteOrderOptions: { value: string; label: string }[] = [];
   const creditNoteOrderKeys = new Set<string>();
@@ -1774,7 +2166,7 @@ function App() {
         <div className="workspace-label">WORKSPACE</div>
         <Menu
           mode="inline"
-          selectedKeys={[activeNav]}
+          selectedKeys={['matching']}
           items={navigationItems}
           onClick={({ key }) => handleNav(key)}
           className="primary-menu"
@@ -1899,15 +2291,7 @@ function App() {
                   options={getStatuses().map(status => ({label: status, value: status}))}
                 />
               </div>
-              <Button 
-                onClick={() => {
-                  setOrderFilter('');
-                  setSupplierSiteFilter('');
-                  setDocumentFilter('');
-                  setStatusFilter('');
-                  setOrderPage(1);
-                }}
-              >
+              <Button onClick={clearWorkbenchFilters}>
                 Clear Filters
               </Button>
             </div>
@@ -1988,10 +2372,7 @@ function App() {
                                         </>
                                       ) : <div>Invoice details unavailable in this browser</div>}
                                     </div>
-                                    {invoice && <Button type="text" size="small" onClick={() => {
-                                      setDetailInvoiceId(id);
-                                      setInvoiceDetailOpen(true);
-                                    }}>Details</Button>}
+                                    {invoice && <Button type="text" size="small" onClick={() => openInvoiceDetails(invoice)}>Details</Button>}
                                   </div>
                                 );
                               })}
@@ -2007,13 +2388,12 @@ function App() {
                                       {receipt ? (
                                         <>
                                           <div>{receipt.date}</div>
-                                          <div>{receipt.quantity} units · {money(receipt.amount)}</div>
+                                          <div>{receipt.quantity} units · {money(receipt.amount, receipt.currency)}</div>
                                         </>
                                       ) : <div>Receipt details unavailable in this browser</div>}
                                     </div>
                                     {receipt && <Button type="text" size="small" onClick={() => {
-                                      setDetailInvoiceId(invoices.find(inv => inv.orderNo === order.orderNo && inv.receipts.some(item => item.receiptNo === receiptNo))?.id || '');
-                                      setDetailReceiptNo(receiptNo);
+                                      setDetailReceiptKey({ orderNo: order.orderNo, receiptNo });
                                       setReceiptDetailOpen(true);
                                     }}>Details</Button>}
                                   </div>
@@ -2066,10 +2446,7 @@ function App() {
                             <Button 
                               type="text" 
                               size="small" 
-                              onClick={() => {
-                                setDetailInvoiceId(inv.id);
-                                setInvoiceDetailOpen(true);
-                              }}
+                              onClick={() => openInvoiceDetails(inv)}
                               style={{padding: '0 4px', minWidth: 'auto', height: 'auto', lineHeight: 1.2}}
                             >
                               Details
@@ -2114,15 +2491,14 @@ function App() {
                               <div style={{fontWeight: 600, fontSize: 12}}>{receipt.receiptNo}</div>
                               <div style={{fontSize: 11, color: '#999', marginTop: 2}}>{receipt.date}</div>
                               <div style={{fontSize: 11, color: '#666', marginTop: 2}}>
-                                {receipt.quantity} units · {money(receipt.amount)}
+                                {receipt.quantity} units · {money(receipt.amount, receipt.currency)}
                               </div>
                             </div>
                             <Button 
                               type="text" 
                               size="small"
                               onClick={() => {
-                                setDetailInvoiceId(invoices.find(inv => inv.orderNo === order.orderNo && inv.receipts.some(item => item.receiptNo === receipt.receiptNo))?.id || '');
-                                setDetailReceiptNo(receipt.receiptNo);
+                                setDetailReceiptKey({ orderNo: order.orderNo, receiptNo: receipt.receiptNo });
                                 setReceiptDetailOpen(true);
                               }}
                               style={{padding: '0 4px', minWidth: 'auto', height: 'auto', lineHeight: 1.2}}
@@ -2339,6 +2715,7 @@ function App() {
       </Layout>
 
       <Modal
+        className="match-details-modal"
         title="Match Details"
         open={!!matchDetailsKey}
         onCancel={() => setMatchDetailsKey(null)}
@@ -2359,44 +2736,79 @@ function App() {
             {selectedMatchDetails.invoiceIds.length > 1 && (
               <p>These documents were matched as a group. Individual invoice-to-receipt allocations were not recorded.</p>
             )}
-            {selectedMatchDetails.details ? (() => {
+            {(() => {
               const details = selectedMatchDetails.details;
-              const formatCost = (amount: number) => details.currency
-                ? money(amount, details.currency)
+              const comparison = details ?? getCurrentMatchComparison(selectedMatchDetails, invoices);
+              if (!comparison) return (
+                <div className="match-outcome">
+                  <p>Current document comparison is unavailable because one or more matched documents are missing.</p>
+                  <div className="match-confirmed-totals">
+                    <div><strong>Matched totals</strong></div>
+                    <div><span>Quantity</span><strong>Unavailable</strong></div>
+                    <div><span>Amount</span><strong>Unavailable</strong></div>
+                  </div>
+                </div>
+              );
+              const matchedTotals = details && getMatchedTotals(details,
+                selectedMatchDetails.invoiceIds.length > 1 || selectedMatchDetails.receiptNos.length > 1 ? 'aggregate' : 'unknown');
+              const formatCost = (amount: number) => comparison.currency
+                ? money(amount, comparison.currency)
                 : `${new Intl.NumberFormat('en-AE', { maximumFractionDigits: 2 }).format(amount)} (mixed currencies)`;
+              const basisLabel = (choice: MatchResolution | undefined, differs: boolean) => {
+                if (choice?.type === 'invoice') return 'Invoice';
+                if (choice?.type === 'receipt') return 'Receipt';
+                if (choice?.type === 'defer') return 'Deferred';
+                return details && !differs ? 'No variance' : '—';
+              };
               const sections = [
-                { title: 'Quantity', invoice: `${details.invoiceQty} units`, receipt: `${details.receiptQty} units`,
-                  variance: `${Number((details.invoiceQty - details.receiptQty).toFixed(4))} units`,
-                  differs: details.invoiceQty !== details.receiptQty, choice: details.quantityResolution },
-                { title: 'Cost', invoice: formatCost(details.invoiceCost), receipt: formatCost(details.receiptCost),
-                  variance: formatCost(details.invoiceCost - details.receiptCost),
-                  differs: details.invoiceCost !== details.receiptCost, choice: details.costResolution },
+                { title: 'Quantity', invoice: `${comparison.invoiceQty} units`, receipt: `${comparison.receiptQty} units`,
+                  variance: `${Number((comparison.invoiceQty - comparison.receiptQty).toFixed(4))} units`,
+                  differs: comparison.invoiceQty !== comparison.receiptQty, choice: details?.quantityResolution },
+                { title: 'Amount', invoice: formatCost(comparison.invoiceCost), receipt: formatCost(comparison.receiptCost),
+                  variance: formatCost(comparison.invoiceCost - comparison.receiptCost),
+                  differs: comparison.invoiceCost !== comparison.receiptCost, choice: details?.costResolution },
               ];
               return (
-                <>
-                  <Typography.Title level={5} style={{marginTop: 20}}>Original comparison and resolution</Typography.Title>
-                  {details.currency === null && <p>Amounts in different currencies are shown without conversion.</p>}
-                  {sections.map(section => (
-                    <div key={section.title} style={{marginTop: 12}}>
-                      <strong>{section.title}</strong>
-                      <div>Invoice: {section.invoice} · Receipt: {section.receipt} · Variance: {section.variance}</div>
-                      <div>
-                        {section.choice.type ? resolutionLabel(section.choice)
-                          : section.differs ? 'No resolution action recorded' : 'No resolution required'}
-                      </div>
-                      {section.choice.reasonCode && (
-                        <div>Reason: {resolutionReasons[section.choice.reasonCode] ?? section.choice.reasonCode}</div>
-                      )}
-                      {section.choice.comment && <div>Comment: {section.choice.comment}</div>}
+                <div className="match-outcome">
+                  <div className="match-outcome-heading">
+                    <div>
+                      <h4>Match outcome</h4>
+                      {!details && <p>Current document comparison</p>}
                     </div>
-                  ))}
-                  <div style={{marginTop: 16}}>
-                    <strong>Invoice totals at confirmation</strong>
-                    <div>{details.finalInvoiceQty} units · {formatCost(details.finalInvoiceCost)}</div>
+                    <Tag color={selectedMatchDetails.status === 'Posted' ? 'blue' : 'green'}>{selectedMatchDetails.status}</Tag>
                   </div>
-                </>
+                  {comparison.currency === null && <p>Amounts in different currencies are shown without conversion.</p>}
+                  <div className="match-comparison-grid">
+                    {sections.map(section => (
+                      <section className="match-comparison-card" key={section.title}>
+                        <h5>{section.title}</h5>
+                        <dl>
+                          <div><dt>Invoice</dt><dd>{section.invoice}</dd></div>
+                          <div><dt>Receipt</dt><dd>{section.receipt}</dd></div>
+                          <div className={section.differs ? 'match-variance' : ''}><dt>Variance</dt><dd>{section.variance}</dd></div>
+                        </dl>
+                        <div className="match-basis">
+                          <span>Matching basis</span>
+                          <strong>{basisLabel(section.choice, section.differs)}</strong>
+                        </div>
+                        {section.choice?.reasonCode && (
+                          <div className="match-resolution-note">Reason: {resolutionReasons[section.choice.reasonCode] ?? section.choice.reasonCode}</div>
+                        )}
+                        {section.choice?.comment && <div className="match-resolution-note">Comment: {section.choice.comment}</div>}
+                      </section>
+                    ))}
+                  </div>
+                  <div className="match-confirmed-totals">
+                    <div>
+                      <strong>Matched totals</strong>
+                      <span>Values accepted for matching.</span>
+                    </div>
+                    <div><span>Quantity</span><strong>{matchedTotals?.quantity === undefined ? 'Unavailable' : `${matchedTotals.quantity} units`}</strong></div>
+                    <div><span>Amount</span><strong>{matchedTotals?.amount === undefined ? 'Unavailable' : formatCost(matchedTotals.amount)}</strong></div>
+                  </div>
+                </div>
               );
-            })() : <p style={{marginTop: 16}}>Resolution details unavailable.</p>}
+            })()}
           </>
         ) : <p>Match details are no longer available.</p>}
       </Modal>
@@ -2457,32 +2869,51 @@ function App() {
 
       <Modal
         className="invoice-maintenance-modal"
-        title={<div className="invoice-maintenance-title"><span>Invoice Maintenance</span><Tag color="processing">New Merchandise Invoice</Tag></div>}
+        title={<div className="invoice-maintenance-title"><span>{detailDraftBaseline ? 'Invoice Details' : 'Invoice Maintenance'}</span><Tag color="processing">{detailDraftBaseline ? detailInvoice?.status : 'New Merchandise Invoice'}</Tag></div>}
         open={reimCreateOpen}
-        onCancel={() => setReimCreateOpen(false)}
-        onOk={handleCreateReimInvoice}
-        okText="Create invoice"
+        onCancel={closeReimCreate}
+        closable={!savingInvoice}
+        maskClosable={!savingInvoice}
+        keyboard={!savingInvoice}
+        footer={detailDraftBaseline ? [
+          <Button key="close" onClick={closeReimCreate} disabled={savingInvoice}>Close</Button>,
+          editingInvoice
+            ? <Button key="cancel" onClick={() => {
+              invoiceItemsReadId.current += 1;
+              setPendingInvoiceItems(null);
+              setInvoiceDraft(detailDraftBaseline);
+              setEditingInvoice(false);
+            }} disabled={savingInvoice}>Cancel editing</Button>
+            : null,
+          editingInvoice
+            ? <Button key="save" type="primary" loading={savingInvoice} onClick={() => void handleSaveInvoice()}>Save</Button>
+            : <Button key="edit" type="primary" disabled={!detailInvoice || detailInvoice.status !== 'Ready to Match' || !matchState || !!matchServiceError || !!getInvoiceMatch(detailInvoice.orderNo, detailInvoice.id)} onClick={() => setEditingInvoice(true)}>Edit</Button>,
+        ] : [
+          <Button key="cancel" onClick={closeReimCreate}>Cancel</Button>,
+          <Button key="create" type="primary" onClick={handleCreateReimInvoice}>Create invoice</Button>,
+        ]}
         width={1120}
       >
+        <ConfigProvider componentDisabled={detailReadOnly || savingInvoice}>
         <div className="invoice-maintenance-window">
           <div className="invoice-header-fields">
             <label className="invoice-field">Document type<Input value={invoiceDraft.documentType} disabled /></label>
             <label className="invoice-field">Invoice number *<Input value={invoiceDraft.invoiceNo} onChange={event => setInvoiceDraft(current => ({ ...current, invoiceNo: event.target.value }))} autoFocus /></label>
-            <label className="invoice-field">Invoice status<Input value="Ready to Match" disabled /></label>
+            <label className="invoice-field">Invoice status<Input value={detailInvoice?.status ?? 'Ready to Match'} disabled /></label>
             <label className="invoice-field">Group ID<Input value={invoiceDraft.groupId} onChange={event => setInvoiceDraft(current => ({ ...current, groupId: event.target.value }))} /></label>
             <label className="invoice-field">Invoice date<Input type="date" value={invoiceDraft.invoiceDate} onChange={event => setInvoiceDraft(current => ({ ...current, invoiceDate: event.target.value }))} /></label>
             <label className="invoice-field">Match date<Input type="date" value={invoiceDraft.matchDate} onChange={event => setInvoiceDraft(current => ({ ...current, matchDate: event.target.value }))} /></label>
             <label className="invoice-field">Invoice terms<Input value={invoiceDraft.invoiceTerms} onChange={event => setInvoiceDraft(current => ({ ...current, invoiceTerms: event.target.value }))} /></label>
             <label className="invoice-field">Order terms<Input value={invoiceDraft.orderTerms} onChange={event => setInvoiceDraft(current => ({ ...current, orderTerms: event.target.value }))} /></label>
             <label className="invoice-field">Supplier terms<Input value={invoiceDraft.supplierTerms} onChange={event => setInvoiceDraft(current => ({ ...current, supplierTerms: event.target.value }))} /></label>
-            <label className="invoice-field">Vendor type<Select value={invoiceDraft.vendorType} options={[{ value: 'Supplier', label: 'Supplier' }]} /></label>
+            <label className="invoice-field">Vendor type<Select value={invoiceDraft.vendorType || undefined} onChange={vendorType => setInvoiceDraft(current => ({ ...current, vendorType }))} options={[{ value: 'Supplier', label: 'Supplier' }]} /></label>
             <label className="invoice-field">Supplier site number *<Input value={invoiceDraft.supplierSite} onChange={event => setInvoiceDraft(current => ({ ...current, supplierSite: event.target.value }))} /></label>
             <label className="invoice-field">Supplier site name *<Input value={invoiceDraft.supplierSiteName} onChange={event => setInvoiceDraft(current => ({ ...current, supplierSiteName: event.target.value }))} /></label>
             <label className="invoice-field">Order type<Select value={invoiceDraft.type} onChange={type => setInvoiceDraft(current => ({ ...current, type }))} options={['CFS', 'CDC', 'RDC', 'Local', 'DSD', 'Direct'].map(type => ({ value: type, label: type }))} /></label>
-            <label className="invoice-field">Order number *<Input value={invoiceDraft.orderNo} onChange={event => setInvoiceDraft(current => ({ ...current, orderNo: event.target.value }))} /></label>
+            <label className="invoice-field">Order number *<Input value={invoiceDraft.orderNo} disabled={!!detailDraftBaseline || detailReadOnly || savingInvoice} onChange={event => setInvoiceDraft(current => ({ ...current, orderNo: event.target.value }))} /></label>
             <label className="invoice-field">Location<Input value={invoiceDraft.location} onChange={event => setInvoiceDraft(current => ({ ...current, location: event.target.value }))} /></label>
             <label className="invoice-field">Invoice currency<Select value={invoiceDraft.currency} onChange={currency => setInvoiceDraft(current => ({ ...current, currency }))} options={['AED', 'SAR', 'OMR', 'BHD', 'KWD', 'QAR'].map(currency => ({ value: currency, label: currency }))} /></label>
-            <label className="invoice-field">Exchange rate<InputNumber min={0} value={invoiceDraft.exchangeRate} onChange={value => setInvoiceDraft(current => ({ ...current, exchangeRate: value ?? 1 }))} /></label>
+            <label className="invoice-field">Exchange rate<InputNumber min={0} value={invoiceDraft.exchangeRate} onChange={value => setInvoiceDraft(current => ({ ...current, exchangeRate: value }))} /></label>
             <label className="invoice-field">Due date<Input type="date" value={invoiceDraft.dueDate} onChange={event => setInvoiceDraft(current => ({ ...current, dueDate: event.target.value }))} /></label>
             <label className="invoice-field">Freight payment type<Select allowClear value={invoiceDraft.freightPaymentType || undefined} onChange={value => setInvoiceDraft(current => ({ ...current, freightPaymentType: value ?? '' }))} options={['Collect', 'Prepaid', 'Third Party'].map(value => ({ value, label: value }))} /></label>
             <label className="invoice-field">Payment hold status<Input value={invoiceDraft.paymentHoldStatus} disabled /></label>
@@ -2498,24 +2929,75 @@ function App() {
               ['directStoreDelivery', 'Direct Store Delivery'],
               ['evaluatedReceiptSettlement', 'Evaluated Receipt Settlement'],
             ] as const).map(([field, label]) => (
-              <Checkbox key={field} checked={invoiceDraft[field]} onChange={event => setInvoiceDraft(current => ({ ...current, [field]: event.target.checked }))}>{label}</Checkbox>
+              <Checkbox key={field} checked={invoiceDraft[field] === true} indeterminate={invoiceDraft[field] === null} onChange={event => setInvoiceDraft(current => ({ ...current, [field]: event.target.checked }))}>{label}</Checkbox>
             ))}
           </div>
 
+          <section className="invoice-items">
+            <div className="invoice-totals-header">
+              <strong>Invoice items *</strong>
+              <div className="invoice-item-actions">
+                <Button disabled={false} icon={<DownloadOutlined />} onClick={downloadInvoiceItems}>Download CSV</Button>
+                <Button icon={<UploadOutlined />} onClick={() => invoiceItemsFileRef.current?.click()}>Upload CSV</Button>
+                <Button icon={<PlusOutlined />} onClick={() => setInvoiceDraft(current => ({
+                  ...current, items: [...current.items, createInvoiceDraftItem()],
+                }))}>Add item</Button>
+              </div>
+            </div>
+            <input ref={invoiceItemsFileRef} type="file" accept=".csv,text/csv" hidden onChange={uploadInvoiceItems} />
+            <p>Download and edit items in a UTF-8 CSV file. Uploading replaces the current list. Keep item numbers as text to preserve leading zeros.</p>
+            {invoiceDraft.items.length === 0 && <p>{detailReadOnly ? 'No invoice items recorded.' : 'Add at least one invoice item.'}</p>}
+            {invoiceDraft.items.map((item, index) => {
+              const amount = getInvoiceItemAmount(item);
+              return (
+                <div className="invoice-item" key={item.id}>
+                  <div className="invoice-item-heading">
+                    <strong>Item {index + 1}</strong>
+                    <Button type="link" danger onClick={() => setInvoiceDraft(current => ({
+                      ...current, items: current.items.filter(row => row.id !== item.id),
+                    }))} aria-label={`Remove item ${index + 1}`}>Remove</Button>
+                  </div>
+                  <div className="invoice-item-fields">
+                    <label className="invoice-field">Item number *
+                      <Input aria-label={`Item ${index + 1} number`} value={item.item}
+                        onChange={event => updateInvoiceDraftItem(item.id, { item: event.target.value })} />
+                    </label>
+                    <label className="invoice-field">Description
+                      <Input aria-label={`Item ${index + 1} description`} value={item.description}
+                        onChange={event => updateInvoiceDraftItem(item.id, { description: event.target.value })} />
+                    </label>
+                    <label className="invoice-field">Quantity *
+                      <InputNumber aria-label={`Item ${index + 1} quantity`} min={1} precision={0} value={item.quantity}
+                        onChange={quantity => updateInvoiceDraftItem(item.id, { quantity })} />
+                    </label>
+                    <label className="invoice-field">Unit cost ex tax *
+                      <InputNumber aria-label={`Item ${index + 1} unit cost`} min={0} precision={4} value={item.unitCost}
+                        onChange={unitCost => updateInvoiceDraftItem(item.id, { unitCost })} />
+                    </label>
+                    <div className="invoice-total-value"><span>Line total ex tax</span><strong>{amount === undefined ? '—' : money(amount, invoiceDraft.currency)}</strong></div>
+                  </div>
+                </div>
+              );
+            })}
+          </section>
+
           <div className="invoice-totals-header">
             <strong>Invoice totals</strong>
-            <Button icon={<FileSearchOutlined />} onClick={() => setTaxEditorOpen(true)}>Tax breakdown</Button>
+            <Button disabled={false} icon={<FileSearchOutlined />} onClick={() => {
+              taxEditorOriginal.current = { taxCode: invoiceDraft.taxCode, taxRate: invoiceDraft.taxRate };
+              setTaxEditorOpen(true);
+            }}>Tax breakdown</Button>
           </div>
+          {detailInvoice && financialChanged && <p>Changes to items, tax or charges recalculate the invoice total. Complete the tax and charges before saving.</p>}
           <div className="invoice-totals-grid">
-            <label className="invoice-field">Total merchandise cost ex tax<InputNumber min={0} precision={2} value={invoiceDraft.costExTax} onChange={value => setInvoiceDraft(current => ({ ...current, costExTax: value ?? 0 }))} /></label>
-            <label className="invoice-field">Total non-merch cost ex tax<InputNumber min={0} precision={2} value={invoiceDraft.nonMerchCostExTax} onChange={value => setInvoiceDraft(current => ({ ...current, nonMerchCostExTax: value ?? 0 }))} /></label>
-            <div className="invoice-total-value"><span>Total cost ex tax</span><strong>{money(totalExTax, invoiceDraft.currency)}</strong></div>
-            <div className="invoice-total-value"><span>Total tax cost · {invoiceDraft.taxCode} {invoiceDraft.taxRate}%</span><strong>{money(draftTaxCost, invoiceDraft.currency)}</strong></div>
-            <label className="invoice-field">Invoice quantity<InputNumber min={0} precision={0} value={invoiceDraft.invoiceQty} onChange={value => setInvoiceDraft(current => ({ ...current, invoiceQty: value ?? 0 }))} /></label>
-            <label className="invoice-field">Total allowances<InputNumber min={0} precision={2} value={invoiceDraft.allowances} onChange={value => setInvoiceDraft(current => ({ ...current, allowances: value ?? 0 }))} /></label>
-            <div className="invoice-total-value invoice-grand-total"><span>Total cost inc tax</span><strong>{money(totalInvoiceCost, invoiceDraft.currency)}</strong></div>
+            <div className="invoice-total-value"><span>Total merchandise cost ex tax</span><strong>{!invoiceDraft.items.length && detailInvoice?.legacyDetails && !financialChanged ? money(detailInvoice.legacyDetails.costExTax, invoiceDraft.currency) : invoiceDraft.items.length ? money(draftItemTotals.merchandiseCost, invoiceDraft.currency) : '—'}</strong></div>
+            <label className="invoice-field">Total non-merch cost ex tax<InputNumber min={0} precision={2} value={invoiceDraft.nonMerchCostExTax} onChange={value => setInvoiceDraft(current => ({ ...current, nonMerchCostExTax: value }))} /></label>
+            <div className="invoice-total-value"><span>Total cost ex tax</span><strong>{!invoiceDraft.items.length && detailInvoice?.legacyDetails && !financialChanged ? money(detailInvoice.legacyDetails.costExTax + detailInvoice.legacyDetails.nonMerchCostExTax, invoiceDraft.currency) : totalExTax === null || !invoiceDraft.items.length ? '—' : money(totalExTax, invoiceDraft.currency)}</strong></div>
+            <div className="invoice-total-value"><span>Total tax cost{invoiceDraft.taxCode ? ` · ${invoiceDraft.taxCode}` : ''}{invoiceDraft.taxRate !== null ? ` ${invoiceDraft.taxRate}%` : ''}</span><strong>{detailInvoice?.legacyDetails && !financialChanged ? money(detailInvoice.legacyDetails.taxCost, invoiceDraft.currency) : draftTaxCost === null || !invoiceDraft.items.length ? '—' : money(draftTaxCost, invoiceDraft.currency)}</strong></div>
+            <div className="invoice-total-value"><span>Invoice quantity</span><strong>{!invoiceDraft.items.length && detailInvoice?.legacyDetails && !financialChanged ? detailInvoice.legacyDetails.invoiceQty : invoiceDraft.items.length ? draftItemTotals.quantity : '—'}</strong></div>
+            <label className="invoice-field">Total allowances<InputNumber min={0} precision={2} value={invoiceDraft.allowances} onChange={value => setInvoiceDraft(current => ({ ...current, allowances: value }))} /></label>
+            <div className="invoice-total-value invoice-grand-total"><span>Total cost inc tax</span><strong>{detailInvoice && !financialChanged ? money(detailInvoice.amount, invoiceDraft.currency) : totalInvoiceCost === null ? '—' : money(totalInvoiceCost, invoiceDraft.currency)}</strong></div>
           </div>
-
           <div className="invoice-reference-fields">
             <label className="invoice-field">Ref No. 1<Input value={invoiceDraft.refNo1} onChange={event => setInvoiceDraft(current => ({ ...current, refNo1: event.target.value }))} /></label>
             <label className="invoice-field">Ref No. 2<Input value={invoiceDraft.refNo2} onChange={event => setInvoiceDraft(current => ({ ...current, refNo2: event.target.value }))} /></label>
@@ -2523,23 +3005,45 @@ function App() {
             <label className="invoice-field">Ref No. 4<Input value={invoiceDraft.refNo4} onChange={event => setInvoiceDraft(current => ({ ...current, refNo4: event.target.value }))} /></label>
           </div>
         </div>
+        </ConfigProvider>
+      </Modal>
+
+      <Modal
+        title="Replace invoice items?"
+        open={pendingInvoiceItems !== null}
+        onCancel={() => setPendingInvoiceItems(null)}
+        onOk={() => {
+          if (pendingInvoiceItems === null) return;
+          setInvoiceDraft(current => ({ ...current, items: pendingInvoiceItems }));
+          messageApi.success(`${pendingInvoiceItems.length} invoice item${pendingInvoiceItems.length === 1 ? '' : 's'} uploaded.`);
+          setPendingInvoiceItems(null);
+        }}
+        okText="Replace items"
+      >
+        <p>Replace the current item list with {pendingInvoiceItems?.length ?? 0} item(s) from the CSV? Items removed from the file will be removed from the invoice.</p>
       </Modal>
 
       <Modal
         className="tax-code-modal"
         title="Tax Breakdown"
         open={taxEditorOpen}
-        onCancel={() => setTaxEditorOpen(false)}
+        onCancel={() => {
+          if (taxEditorOriginal.current) setInvoiceDraft(current => ({ ...current, ...taxEditorOriginal.current }));
+          setTaxEditorOpen(false);
+        }}
         footer={[
-          <Button key="cancel" onClick={() => setTaxEditorOpen(false)}>Cancel</Button>,
-          <Button key="apply" type="primary" onClick={() => setTaxEditorOpen(false)}>Apply tax code</Button>,
+          <Button key="cancel" onClick={() => {
+            if (taxEditorOriginal.current) setInvoiceDraft(current => ({ ...current, ...taxEditorOriginal.current }));
+            setTaxEditorOpen(false);
+          }}>{detailReadOnly ? 'Close' : 'Cancel'}</Button>,
+          ...(!detailReadOnly ? [<Button key="apply" type="primary" onClick={() => setTaxEditorOpen(false)}>Apply tax code</Button>] : []),
         ]}
         width={700}
       >
         <div className="tax-breakdown-summary">
-          <div><span>Ex tax basis</span><strong>{money(totalExTax, invoiceDraft.currency)}</strong></div>
-          <div><span>Selected tax code</span><strong>{invoiceDraft.taxCode} · {invoiceDraft.taxRate}%</strong></div>
-          <div><span>Tax total</span><strong>{money(draftTaxCost, invoiceDraft.currency)}</strong></div>
+          <div><span>Ex tax basis</span><strong>{totalExTax === null || !invoiceDraft.items.length ? '—' : money(totalExTax, invoiceDraft.currency)}</strong></div>
+          <div><span>Selected tax code</span><strong>{invoiceDraft.taxCode ? `${invoiceDraft.taxCode} · ${invoiceDraft.taxRate}%` : '—'}</strong></div>
+          <div><span>Tax total</span><strong>{draftTaxCost === null || !invoiceDraft.items.length ? '—' : money(draftTaxCost, invoiceDraft.currency)}</strong></div>
         </div>
         <Table
           className="legacy-tax-table"
@@ -2547,7 +3051,7 @@ function App() {
           rowKey="code"
           pagination={false}
           dataSource={legacyTaxCodes}
-          rowSelection={{
+          rowSelection={detailReadOnly ? undefined : {
             type: 'radio',
             selectedRowKeys: [invoiceDraft.taxCode],
             onChange: keys => {
@@ -2556,13 +3060,13 @@ function App() {
               if (selectedTax) setInvoiceDraft(current => ({ ...current, taxCode: selectedTax.code, taxRate: selectedTax.rate }));
             },
           }}
-          onRow={tax => ({
+          onRow={detailReadOnly ? undefined : tax => ({
             onClick: () => setInvoiceDraft(current => ({ ...current, taxCode: tax.code, taxRate: tax.rate })),
           })}
           columns={[
             { title: 'Tax code', dataIndex: 'code', key: 'code' },
             { title: 'Tax rate', dataIndex: 'rate', key: 'rate', align: 'right', render: (rate: number) => `${rate}%` },
-            { title: 'Tax amount', key: 'amount', align: 'right', render: (_, tax: { rate: number }) => money(Number((totalExTax * tax.rate / 100).toFixed(2)), invoiceDraft.currency) },
+            { title: 'Tax amount', key: 'amount', align: 'right', render: (_, tax: { rate: number }) => totalExTax === null || !invoiceDraft.items.length ? '—' : money(Number((totalExTax * tax.rate / 100).toFixed(2)), invoiceDraft.currency) },
           ]}
         />
       </Modal>
@@ -2738,8 +3242,8 @@ function App() {
                       onChange={(e) => setCostResolution({...costResolution, type: e.target.value as 'invoice' | 'receipt' | 'defer'})}
                     >
                       <Space direction="vertical">
-                        <Radio value="invoice">Invoice ({resolutionIsAggregate ? 'Total' : 'Per Unit'}): {money(invoiceCost, currentInvoice.currency)}</Radio>
-                        <Radio value="receipt">Receipt ({resolutionIsAggregate ? 'Total' : 'Per Unit'}): {money(receiptCost, currentInvoice.currency)}</Radio>
+                        <Radio value="invoice">Invoice ({resolutionIsAggregate ? 'Total' : 'Per Unit'}): {resolutionIsAggregate ? money(invoiceCost, currentInvoice.currency) : unitMoney(invoiceCost, currentInvoice.currency)}</Radio>
+                        <Radio value="receipt">Receipt ({resolutionIsAggregate ? 'Total' : 'Per Unit'}): {resolutionIsAggregate ? money(receiptCost, currentInvoice.currency) : unitMoney(receiptCost, currentInvoice.currency)}</Radio>
                         <Radio value="defer">Defer Cost Resolution</Radio>
                       </Space>
                     </Radio.Group>
@@ -2853,7 +3357,7 @@ function App() {
                     {title: 'Item', dataIndex: 'item', width: 120},
                     {title: 'Description', dataIndex: 'description', render: (text) => <span style={{fontSize: 12}}>{text}</span>},
                     {title: 'Qty', dataIndex: 'invoiceQty', width: 80, align: 'right'},
-                    {title: 'Unit Cost', dataIndex: 'unitCost', width: 100, align: 'right', render: (value) => money(value)},
+                    {title: 'Unit Cost', dataIndex: 'unitCost', width: 100, align: 'right', render: (value) => unitMoney(value, invoice.currency)},
                     {title: 'Tax', dataIndex: 'tax', width: 60},
                   ]}
                 />
@@ -2897,6 +3401,7 @@ function App() {
 
       {/* RECEIPT DETAIL MODAL */}
       <Modal
+        className="receipt-details-modal"
         title="Receipt Details"
         open={receiptDetailOpen}
         onCancel={() => setReceiptDetailOpen(false)}
@@ -2906,102 +3411,43 @@ function App() {
         ]}
       >
         {(() => {
-          const invoice = invoices.find(inv => inv.id === detailInvoiceId);
-          const receipt = invoice?.receipts.find(r => r.receiptNo === detailReceiptNo);
-          
-          if (!receipt || !invoice) return null;
-          
+          const receipt = detailReceiptKey
+            ? getReceiptsForOrder(detailReceiptKey.orderNo).find(item => item.receiptNo === detailReceiptKey.receiptNo)
+            : undefined;
+
+          if (!receipt || !detailReceiptKey) return <p>Receipt details could not be found.</p>;
+
           return (
-            <div style={{marginTop: 16}}>
-              {/* RECEIPT HEADER */}
-              <div style={{marginBottom: 24, paddingBottom: 16, borderBottom: '1px solid #f0f0f0'}}>
-                <div style={{display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 20}}>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Receipt Number</div>
-                    <div style={{fontWeight: 600, fontSize: 13}}>{receipt.receiptNo}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Receipt Date</div>
-                    <div style={{fontWeight: 600, fontSize: 13}}>{receipt.date}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Receipt Quantity</div>
-                    <div style={{fontWeight: 600, fontSize: 13}}>{receipt.quantity} units</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Receipt Amount</div>
-                    <div style={{fontWeight: 600, fontSize: 13}}>{money(receipt.amount)}</div>
-                  </div>
-                </div>
+            <div className="receipt-details">
+              <div className="receipt-details-header">
+                <div><span>Receipt number</span><strong>{receipt.receiptNo}</strong></div>
+                <div><span>Receipt date</span><strong>{receipt.date}</strong></div>
+                <div><span>Order number</span><strong>{detailReceiptKey.orderNo}</strong></div>
+                <div><span>Location</span><strong>{receipt.location}</strong></div>
               </div>
-
-              {/* RELATED INVOICE */}
-              <div style={{marginBottom: 24}}>
-                <h4 style={{marginTop: 0, marginBottom: 12}}>Related Invoice</h4>
-                <div style={{display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 20, background: '#f0f4ff', padding: 16, borderRadius: 4, border: '1px solid #d9e8ff'}}>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Invoice Number</div>
-                    <div style={{fontWeight: 600}}>{invoice.invoiceNo}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Order Number</div>
-                    <div style={{fontWeight: 600}}>{invoice.orderNo}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Supplier Site</div>
-                    <div style={{fontWeight: 600}}>{getSupplierSiteDisplay(invoice)}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Location</div>
-                    <div style={{fontWeight: 600}}>{receipt.location}</div>
-                  </div>
+              <section className="receipt-items">
+                <div className="receipt-items-heading">
+                  <h4>Receipt items</h4>
+                  <span>{receipt.items.length} {receipt.items.length === 1 ? 'item' : 'items'}</span>
                 </div>
-              </div>
-
-              {/* LOCATION & STORAGE INFO */}
-              <div style={{marginBottom: 24}}>
-                <h4 style={{marginTop: 0, marginBottom: 12}}>Receipt Location</h4>
-                <div style={{background: '#fafafa', padding: 16, borderRadius: 4, display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 16}}>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Location</div>
-                    <div style={{fontWeight: 500}}>{receipt.location}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Storage Status</div>
-                    <Tag color="blue">In Stock</Tag>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Received Date</div>
-                    <div style={{fontWeight: 500}}>{receipt.date}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Condition</div>
-                    <Tag color="green">Good</Tag>
-                  </div>
-                </div>
-              </div>
-
-              {/* COMPARISON WITH INVOICE */}
-              <div>
-                <h4 style={{marginTop: 0, marginBottom: 12}}>Comparison with Invoice</h4>
-                <div style={{background: '#fafafa', padding: 16, borderRadius: 4}}>
-                  <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16}}>
-                    <div>
-                      <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Metric</div>
-                      <div style={{fontWeight: 600}}>Qty</div>
-                    </div>
-                    <div>
-                      <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Invoice</div>
-                      <div style={{fontWeight: 600}}>{invoice.lines[0]?.invoiceQty || 0} units</div>
-                    </div>
-                    <div>
-                      <div style={{fontSize: 11, color: '#999', marginBottom: 4}}>Receipt</div>
-                      <div style={{fontWeight: 600, color: receipt.quantity !== (invoice.lines[0]?.invoiceQty || 0) ? '#f5222d' : '#52c41a'}}>
-                        {receipt.quantity} units {receipt.quantity !== (invoice.lines[0]?.invoiceQty || 0) && <span style={{color: '#f5222d'}}> ✗ Variance</span>}
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                <Table
+                  dataSource={receipt.items.map((item, index) => ({ ...item, key: index }))}
+                  pagination={false}
+                  size="middle"
+                  scroll={{ x: 520 }}
+                  locale={{ emptyText: 'No receipt items recorded.' }}
+                  columns={[
+                    { title: 'Item number', dataIndex: 'item', key: 'item', width: 115 },
+                    { title: 'Description', dataIndex: 'description', key: 'description' },
+                    { title: 'Received qty', dataIndex: 'quantity', key: 'quantity', align: 'right', width: 100 },
+                    { title: 'Unit cost', dataIndex: 'unitCost', key: 'unitCost', align: 'right', width: 115, render: (value: number) => unitMoney(value, receipt.currency) },
+                    { title: 'Amount', dataIndex: 'amount', key: 'amount', align: 'right', width: 115, render: (value: number) => money(value, receipt.currency) },
+                  ]}
+                />
+              </section>
+              <div className="receipt-totals">
+                <div><span>Receipt quantity</span><strong>{receipt.quantity} units</strong></div>
+                <div><span>Receipt amount</span><strong>{money(receipt.amount, receipt.currency)}</strong></div>
               </div>
             </div>
           );
