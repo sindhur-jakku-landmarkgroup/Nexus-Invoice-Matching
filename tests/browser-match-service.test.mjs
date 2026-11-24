@@ -1,32 +1,15 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { after, before, test } from 'node:test';
 import { createServer } from 'vite';
 
 let server;
-let getBrowserMatches;
-let saveBrowserMatch;
+let createBrowserMatchSession;
 let getCurrentMatchComparison;
 let getMatchedTotals;
-let stored;
-let lockQueue = Promise.resolve();
 
 before(async () => {
-  Object.defineProperty(globalThis, 'navigator', {
-    configurable: true,
-    value: { locks: { request: (_name, callback) => {
-      const result = lockQueue.then(callback);
-      lockQueue = result.catch(() => {});
-      return result;
-    } } },
-  });
-  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { randomUUID } });
-  globalThis.localStorage = {
-    getItem: () => stored ?? null,
-    setItem: (_key, value) => { stored = value; },
-  };
   server = await createServer({ logLevel: 'silent', server: { middlewareMode: true } });
-  ({ getBrowserMatches, saveBrowserMatch } = await server.ssrLoadModule('/src/browserMatches.ts'));
+  ({ createBrowserMatchSession } = await server.ssrLoadModule('/src/browserMatches.ts'));
   ({ getCurrentMatchComparison, getMatchedTotals } = await server.ssrLoadModule('/src/mockMatches.ts'));
 });
 
@@ -53,46 +36,32 @@ const request = invoiceId => ({
   },
 });
 
-test('browser matches persist and simultaneous claims cannot reuse a receipt', async () => {
-  const initial = await getBrowserMatches();
+test('matches remain in the page session and simultaneous claims cannot reuse a receipt', async () => {
+  const session = createBrowserMatchSession();
+  const initial = await session.getMatches();
   assert.ok(initial.matches.some(match => match.invoiceIds.includes('EX-6502415-1')));
 
-  const results = await Promise.all(['A', 'B'].map(id => saveBrowserMatch(request(id))));
+  const results = await Promise.all(['A', 'B'].map(id => session.saveMatch(request(id))));
   assert.deepEqual(results.map(result => result.conflict).sort(), [false, true]);
-  const reloaded = await getBrowserMatches();
-  assert.equal(reloaded.instanceId, initial.instanceId);
-  assert.equal(reloaded.matches.filter(match => match.orderNo === 'DEMO-ORDER').length, 1);
-  assert.deepEqual(reloaded.matches.find(match => match.orderNo === 'DEMO-ORDER').details, request('A').details);
+  const current = await session.getMatches();
+  assert.equal(initial.matches.some(match => match.orderNo === 'DEMO-ORDER'), false);
+  assert.equal(current.matches.filter(match => match.orderNo === 'DEMO-ORDER').length, 1);
+  assert.deepEqual(current.matches.find(match => match.orderNo === 'DEMO-ORDER').details, request('A').details);
 });
 
-test('existing example data gains matched totals without changing other matches', async () => {
-  const state = await getBrowserMatches();
-  for (const match of state.matches.filter(match => match.orderNo !== 'DEMO-ORDER')) delete match.details;
-  const userMatch = state.matches.find(match => match.orderNo === 'DEMO-ORDER');
-  const existingDetails = structuredClone(userMatch.details);
-  stored = JSON.stringify(state);
+test('a fresh page session restores seeded matches without affecting other open sessions', async () => {
+  const first = createBrowserMatchSession();
+  const second = createBrowserMatchSession();
+  await first.saveMatch(request('A'));
+  assert.equal((await second.getMatches()).matches.some(match => match.orderNo === 'DEMO-ORDER'), false);
 
-  const updated = await getBrowserMatches();
-  const decision = updated.matches.find(match => match.orderNo === '6502413').details;
-  assert.equal(decision.quantityResolution.type, 'invoice');
-  assert.equal(decision.costResolution.type, 'invoice');
-  assert.equal(decision.receiptQty, 97);
-  assert.deepEqual(updated.matches.find(match => match.orderNo === '6502412').details.matchedTotals,
+  const refreshed = createBrowserMatchSession();
+  const baseline = await refreshed.getMatches();
+  assert.equal(baseline.matches.some(match => match.orderNo === 'DEMO-ORDER'), false);
+  assert.equal(baseline.matches.find(match => match.orderNo === '6502413').status, 'Posted');
+  assert.deepEqual(baseline.matches.find(match => match.orderNo === '6502412').details.matchedTotals,
     { quantity: 100, amount: 10000 });
-  assert.ok(updated.matches.every(match => match.details?.matchedTotals));
-  assert.equal(updated.version, state.version + 1);
-  assert.deepEqual(updated.matches.find(match => match.orderNo === 'DEMO-ORDER').details, existingDetails);
-  assert.equal((await getBrowserMatches()).version, updated.version);
-});
-
-test('invalid saved data and storage failures are reported', async () => {
-  stored = '{';
-  await assert.rejects(getBrowserMatches(), /Saved demo match data is invalid/);
-  stored = undefined;
-  const setItem = localStorage.setItem;
-  localStorage.setItem = () => { throw new Error('Storage unavailable'); };
-  await assert.rejects(getBrowserMatches(), /Storage unavailable/);
-  localStorage.setItem = setItem;
+  assert.equal((await first.getMatches()).matches.some(match => match.orderNo === 'DEMO-ORDER'), true);
 });
 
 test('historical comparison uses only matched documents and reports missing documents', () => {

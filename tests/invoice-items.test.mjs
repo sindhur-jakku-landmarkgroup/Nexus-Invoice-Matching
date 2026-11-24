@@ -9,11 +9,17 @@ let exportInvoiceItemsCsv;
 let importInvoiceItemsCsv;
 let invoiceFinancialsChanged;
 let reconcileInvoiceLines;
+let hasDuplicateInvoice;
+let getItemNumberDifferences;
+let localDateInputValue;
+let unitCostsDiffer;
+let costResolutionRequired;
 
 before(async () => {
   server = await createServer({ logLevel: 'silent', server: { middlewareMode: true } });
   ({ getInvoiceItemTotals, validateInvoiceItems, invoiceFinancialsChanged, reconcileInvoiceLines } = await server.ssrLoadModule('/src/invoiceItems.ts'));
   ({ exportInvoiceItemsCsv, importInvoiceItemsCsv } = await server.ssrLoadModule('/src/invoiceItemsCsv.ts'));
+  ({ hasDuplicateInvoice, getItemNumberDifferences, localDateInputValue, unitCostsDiffer, costResolutionRequired } = await server.ssrLoadModule('/src/matchingRules.ts'));
 });
 
 after(async () => {
@@ -93,4 +99,28 @@ test('editing or importing lines preserves receipt metadata for identifiable ite
     item: row.item, receiptQty: old?.receiptQty ?? 0,
   }));
   assert.deepEqual(result, [{ item: 'B', receiptQty: 8 }, { item: 'A-renamed', receiptQty: 7 }, { item: 'C', receiptQty: 0 }]);
+});
+
+test('duplicate invoice numbers are scoped to supplier site and exclude the edited invoice', () => {
+  const invoices = [{ id: '1', invoiceNo: 'Inv-1', supplierSite: '001' }];
+  assert.equal(hasDuplicateInvoice(invoices, ' inv-1 ', '001'), true);
+  assert.equal(hasDuplicateInvoice(invoices, 'INV-1', '002'), false);
+  assert.equal(hasDuplicateInvoice(invoices, 'INV-1', '001', '1'), false);
+});
+
+test('item differences compare selected groups without assuming document allocations', () => {
+  assert.deepEqual(getItemNumberDifferences([' 001 ', 'B', 'b'], ['001', 'c']), {
+    invoiceOnly: ['b'], receiptOnly: ['c'],
+  });
+  assert.deepEqual(getItemNumberDifferences(['A', 'B'], ['b', 'a']), { invoiceOnly: [], receiptOnly: [] });
+});
+
+test('new dates use local calendar dates and unit cost comparison ignores quantity', () => {
+  assert.equal(localDateInputValue(new Date(2026, 10, 20, 23, 45)), '2026-11-20');
+  assert.equal(unitCostsDiffer(100, 9700 / 97), false);
+  assert.equal(unitCostsDiffer(100, 101), true);
+  assert.equal(costResolutionRequired(false, 10000, 9700, 100, 97), false);
+  assert.equal(costResolutionRequired(false, 10000, 9894, 100, 97), true);
+  assert.equal(costResolutionRequired(false, 10000, 0, 100, 0), undefined);
+  assert.equal(costResolutionRequired(true, 10000, 9700, 100, 97), true);
 });

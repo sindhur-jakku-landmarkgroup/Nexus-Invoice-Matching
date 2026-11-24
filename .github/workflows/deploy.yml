@@ -30,8 +30,6 @@ jobs:
         run: yarn install --immutable
       - name: Build
         run: yarn build
-        env:
-          VITE_MATCH_MODE: browser
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

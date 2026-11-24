@@ -50,11 +50,12 @@ import {
   Typography,
 } from 'antd';
 import type { MenuProps, TableColumnsType } from 'antd';
-import { getBrowserMatches, saveBrowserMatch } from './browserMatches';
+import { createBrowserMatchSession } from './browserMatches';
 import { createInvoiceDraftItem, getInvoiceItemAmount, getInvoiceItemTotals, invoiceFinancialsChanged, reconcileInvoiceLines, validateInvoiceItems } from './invoiceItems';
 import type { InvoiceDraftItem } from './invoiceItems';
 import { exportInvoiceItemsCsv, importInvoiceItemsCsv } from './invoiceItemsCsv';
-import { getCurrentMatchComparison, getMatchedTotals, isMockMatchState } from './mockMatches';
+import { costResolutionRequired, getItemNumberDifferences, hasDuplicateInvoice, localDateInputValue, unitCostsDiffer } from './matchingRules';
+import { getCurrentMatchComparison, getMatchedTotals } from './mockMatches';
 import type { MatchDetails, MatchResolution, MockMatch, MockMatchState } from './mockMatches';
 
 const noteMemoTypes = [
@@ -68,7 +69,6 @@ const noteMemoTypes = [
   'Credit Memo - Cost',
   'Credit Memo - Quantity',
 ] as const;
-const browserMatchDemo = import.meta.env.VITE_MATCH_MODE === 'browser';
 type NoteMemoType = typeof noteMemoTypes[number];
 type InvoiceStatus = 'Ready to Match' | 'Matched' | 'Posted' | 'Approved';
 type InvoiceType = 'CDC' | 'CFS' | 'RDC' | 'Local' | 'DSD' | 'Direct' | NoteMemoType;
@@ -221,9 +221,9 @@ const emptyInvoiceDraft: InvoiceDraft = {
   location: '',
   currency: 'AED',
   exchangeRate: 1,
-  invoiceDate: '2026-11-11',
+  invoiceDate: '',
   matchDate: '',
-  dueDate: '2026-11-11',
+  dueDate: '',
   invoiceTerms: 'Immediate',
   orderTerms: 'Immediate',
   supplierTerms: '30 Days Credit',
@@ -277,6 +277,7 @@ type Invoice = {
   reimCreationEligible?: boolean;
   legacyDetails?: LegacyInvoiceDetails;
   maintenance?: InvoiceDraft;
+  financialDetails?: Pick<InvoiceDraft, 'nonMerchCostExTax' | 'taxCode' | 'taxRate' | 'allowances'>;
   quantityResolution?: ResolutionChoice;
   costResolution?: ResolutionChoice;
   noteMemoDetails?: { location: string; requestReference: string; comment: string };
@@ -408,7 +409,7 @@ export const initialInvoices: Invoice[] = [
     orderNo: '6502402',
     invoiceDate: '10 Nov 2026',
     ageDays: 2,
-    amount: 10000,
+    amount: 10500,
     currency: 'AED',
     status: 'Ready to Match',
     exampleLabel: 'One invoice, multiple receipts, beyond threshold',
@@ -434,6 +435,7 @@ export const initialInvoices: Invoice[] = [
       { item: 'RH-100100', description: 'Sample merchandise A', invoiceQty: 50, receiptQty: 50, unitCost: 100, tax: '5%' },
       { item: 'RH-100101', description: 'Sample merchandise B', invoiceQty: 50, receiptQty: 50, unitCost: 100, tax: '5%' },
     ],
+    financialDetails: { nonMerchCostExTax: 0, taxCode: 'OMSTD', taxRate: 5, allowances: 0 },
     taxResolved: true,
     tolerance: 0,
   },
@@ -787,8 +789,8 @@ const formatVariancePercentage = (variance: number, baseAmount: number): string 
 };
 
 const resolutionLabel = (choice?: ResolutionDraft): string => {
-  if (choice?.type === 'invoice') return 'Resolved: Invoice accepted';
-  if (choice?.type === 'receipt') return 'Resolved: Receipt accepted';
+  if (choice?.type === 'invoice') return 'Resolved: Invoice';
+  if (choice?.type === 'receipt') return 'Resolved: Receipt';
   if (choice?.type === 'defer') return 'Deferred: Resolution required';
   return 'Resolution required';
 };
@@ -857,6 +859,16 @@ const money = (value: number, currency = 'AED') =>
 const unitMoney = (value: number, currency: string) =>
   new Intl.NumberFormat('en-AE', { style: 'currency', currency, maximumFractionDigits: 4 }).format(value);
 
+export const getFinancePostingLines = (receiptAmount: number, now: Date) => {
+  const glDate = new Date(now);
+  glDate.setDate(glDate.getDate() + 1);
+  const date = glDate.toLocaleDateString('en-AE');
+  return [
+    { accountCode: '24109-0000-0000', description: 'AP Liability', amount: receiptAmount, glDate: date },
+    { accountCode: '64318-0000-0000', description: 'Adjustment', amount: receiptAmount, glDate: date },
+  ];
+};
+
 const invoiceDateInput = (date: string) => {
   if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
   const parsed = new Date(date);
@@ -896,9 +908,9 @@ const invoiceToDraft = (invoice: Invoice): InvoiceDraft => {
     consignment: stored?.consignment ?? null,
     directStoreDelivery: stored?.directStoreDelivery ?? null,
     evaluatedReceiptSettlement: stored?.evaluatedReceiptSettlement ?? null,
-    nonMerchCostExTax: stored?.nonMerchCostExTax ?? legacy?.nonMerchCostExTax ?? null,
-    taxCode: stored?.taxCode ?? legacy?.taxCode ?? '',
-    taxRate: stored?.taxRate ?? legacy?.taxRate ?? null,
+    nonMerchCostExTax: stored?.nonMerchCostExTax ?? legacy?.nonMerchCostExTax ?? invoice.financialDetails?.nonMerchCostExTax ?? null,
+    taxCode: stored?.taxCode ?? legacy?.taxCode ?? invoice.financialDetails?.taxCode ?? '',
+    taxRate: stored?.taxRate ?? legacy?.taxRate ?? invoice.financialDetails?.taxRate ?? null,
     items: invoice.lines.map((line, index) => ({
       id: stored?.items[index]?.id ?? crypto.randomUUID(),
       item: line.item,
@@ -906,7 +918,7 @@ const invoiceToDraft = (invoice: Invoice): InvoiceDraft => {
       quantity: line.invoiceQty,
       unitCost: line.unitCost,
     })),
-    allowances: stored?.allowances ?? legacy?.allowances ?? null,
+    allowances: stored?.allowances ?? legacy?.allowances ?? invoice.financialDetails?.allowances ?? null,
     refNo1: stored?.refNo1 ?? legacy?.reference ?? '',
     refNo2: stored?.refNo2 ?? '',
     refNo3: stored?.refNo3 ?? '',
@@ -927,16 +939,17 @@ function App() {
   const [invoices, setInvoices] = useState(initialInvoices);
   const [matchState, setMatchState] = useState<MockMatchState | null>(null);
   const [matchServiceError, setMatchServiceError] = useState('');
-  const matchServiceInstance = useRef<string>();
+  const [matchSession] = useState(createBrowserMatchSession);
   const [selectedId, setSelectedId] = useState('IM-1042');
   const [selectedReceipts, setSelectedReceipts] = useState<Record<string, string[]>>({});
   const [filter, setFilter] = useState('All invoices');
   const [query, setQuery] = useState('');
   const [activeTab, setActiveTab] = useState('matching');
-  const [mobileView, setMobileView] = useState<'queue' | 'detail'>('queue');
   const [taxBreakdownOpen, setTaxBreakdownOpen] = useState(false);
   const [reimCreateOpen, setReimCreateOpen] = useState(false);
   const [invoiceDraft, setInvoiceDraft] = useState<InvoiceDraft>(emptyInvoiceDraft);
+  const createDraftBaseline = useRef<InvoiceDraft | null>(null);
+  const [discardInvoiceDraftOpen, setDiscardInvoiceDraftOpen] = useState(false);
   const [detailDraftBaseline, setDetailDraftBaseline] = useState<InvoiceDraft | null>(null);
   const [editingInvoice, setEditingInvoice] = useState(false);
   const [savingInvoice, setSavingInvoice] = useState(false);
@@ -978,16 +991,7 @@ function App() {
     let active = true;
     const refreshMatches = async () => {
       try {
-        let data: MockMatchState;
-        if (browserMatchDemo) {
-          data = await getBrowserMatches();
-        } else {
-          const response = await fetch('/api/mock/matches', { cache: 'no-store' });
-          if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
-          const result: unknown = await response.json();
-          if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
-          data = result;
-        }
+        const data = await matchSession.getMatches();
         if (active) {
           updateMatchState(data);
           setMatchServiceError('');
@@ -997,23 +1001,16 @@ function App() {
       }
     };
     void refreshMatches();
-    const timer = setInterval(() => void refreshMatches(), 3000);
-    return () => { active = false; clearInterval(timer); };
-  }, []);
+    return () => { active = false; };
+  }, [matchSession]);
 
   useEffect(() => {
     if (!matchState) return;
-    const restarted = !!matchServiceInstance.current && matchServiceInstance.current !== matchState.instanceId;
-    matchServiceInstance.current = matchState.instanceId;
     setInvoices(current => {
       let changed = false;
       const updated = current.map(invoice => {
         if (isNoteMemo(invoice.type)) return invoice;
         const match = matchState.matches.find(item => item.invoiceIds.includes(invoice.id));
-        if (!match && restarted && invoice.matchedAt) {
-          changed = true;
-          return { ...invoice, status: 'Ready to Match' as const, matchedAt: undefined };
-        }
         if (!match || (invoice.status === match.status && invoice.matchedAt === match.matchedAt)) return invoice;
         changed = true;
         return { ...invoice, status: match.status, matchedAt: match.matchedAt, hasException: false };
@@ -1035,16 +1032,12 @@ function App() {
   const [reportComment, setReportComment] = useState('');
   const [exceptionReports, setExceptionReports] = useState<Record<string, { recipients: string[]; reason: string; comment: string; timestamp: string; invoiceIds: string[]; receiptNos: string[] }[]>>({});
 
-  // PHASE 2 ENHANCEMENTS: TAX WORKFLOW STATE
-  const [taxCorrectionOpen, setTaxCorrectionOpen] = useState(false);
-  const [taxOrderNo, setTaxOrderNo] = useState<string>('');
-  const [taxCorrectionReason, setTaxCorrectionReason] = useState<string>('');
-  const [taxCorrectionComment, setTaxCorrectionComment] = useState<string>('');
-  const [taxDiscrepancies, setTaxDiscrepancies] = useState<Record<string, {status: string, currentTax: number, expectedTax: number, reason: string, comment: string, timestamp: string}>>({});
-
   // PHASE 2 ENHANCEMENTS: OFIN POSTING STATE
-  const [offinPostings, setOffinPostings] = useState<Record<string, {status: string, referenceNumber: string, lineItems: any[], timestamp: string}>>({});
-  const [postingProgressOpen, setPostingProgressOpen] = useState(false);
+  const [offinPostings, setOffinPostings] = useState<Record<string, {
+    status: string; referenceNumber: string; currency: string | null; receiptCurrency: string | null;
+    invoiceNumbers: string[]; receiptNos: string[]; matchedQuantity: number; matchedAmount: number;
+    lineItems: { accountCode: string; amount: number; glDate: string; description: string }[]; timestamp: string;
+  }>>({});
   const [postingConfirmationOpen, setPostingConfirmationOpen] = useState(false);
   const [postingOrderNo, setPostingOrderNo] = useState<string>('');
 
@@ -1086,6 +1079,10 @@ function App() {
 
   const getOrderNumbers = () => Array.from(new Set(invoices.map(inv => inv.orderNo)));
   const getSupplierSiteNumber = (invoice: Invoice) => invoice.supplierSiteNo || invoice.legacyDetails?.supplierSite || '';
+  const invoiceNumberExists = (list: Invoice[], invoiceNo: string, supplierSite: string, excludeId?: string) =>
+    hasDuplicateInvoice(list.filter(invoice => !isNoteMemo(invoice.type)).map(invoice => ({
+      id: invoice.id, invoiceNo: invoice.invoiceNo, supplierSite: getSupplierSiteNumber(invoice),
+    })), invoiceNo, supplierSite, excludeId);
   const getSupplierSiteName = (invoice: Invoice) => invoice.supplierSiteName?.trim() || 'Description unavailable';
   const getSupplierSiteDisplay = (invoice: Invoice) => `${getSupplierSiteNumber(invoice) || 'Number unavailable'} · ${getSupplierSiteName(invoice)}`;
   const getSupplierSites = () => {
@@ -1153,7 +1150,9 @@ function App() {
     const resolution = getCurrentOrderResolution(orderNo);
     if (!resolution) return false;
     const quantityDiffers = resolution.originalInvoiceQty !== resolution.originalReceiptQty;
-    const costDiffers = resolution.originalInvoiceCost !== resolution.originalReceiptCost;
+    const costDiffers = costResolutionRequired(resolution.isAggregate, resolution.originalInvoiceCost,
+      resolution.originalReceiptCost, resolution.originalInvoice?.lines[0]?.unitCost, resolution.originalReceiptQty);
+    if (costDiffers === undefined) return false;
     return (!quantityDiffers || (resolution.quantity.type !== undefined && resolution.quantity.type !== 'defer'))
       && (!costDiffers || (resolution.cost.type !== undefined && resolution.cost.type !== 'defer'));
   };
@@ -1171,7 +1170,7 @@ function App() {
     : undefined;
   const resolutionQtyMismatch = !!resolutionLine && !!resolutionReceipt && resolutionLine.invoiceQty !== resolutionReceipt.quantity;
   const resolutionCostMismatch = !!resolutionLine && resolutionReceiptCost !== undefined
-    && Math.round(resolutionLine.unitCost * 100) !== Math.round(resolutionReceiptCost * 100);
+    && unitCostsDiffer(resolutionLine.unitCost, resolutionReceiptCost);
   const resolutionIsAggregate = !!resolutionTarget && (
     (selectedInvoicesByOrder[resolutionTarget.orderNo] || []).length > 1
     || (selectedReceiptsByOrder[resolutionTarget.orderNo] || []).length > 1
@@ -1342,7 +1341,6 @@ function App() {
     setActiveTab('matching');
     setLocalRuleApplied(false);
     setTaxBreakdownOpen(false);
-    setMobileView('detail');
   };
 
   const handleMatch = () => {
@@ -1424,9 +1422,14 @@ function App() {
     const originalInvoiceCost = activeOrderResolution?.originalInvoiceCost ?? getCumulativeInvoiceCostByOrder(orderNo);
     const originalReceiptCost = activeOrderResolution?.originalReceiptCost ?? getCumulativeReceiptCostByOrder(orderNo);
     const quantityDiffers = originalInvoiceQty !== originalReceiptQty;
-    const costDiffers = originalInvoiceCost !== originalReceiptCost;
+    const costDiffers = costResolutionRequired(resolutionIsAggregate, originalInvoiceCost,
+      originalReceiptCost, resolutionLine?.unitCost, originalReceiptQty);
+    if (costDiffers === undefined) {
+      messageApi.warning('Select a valid invoice item and receipt.');
+      return;
+    }
     if ((quantityDiffers && !quantityResolution.type) || (costDiffers && !costResolution.type)) {
-      messageApi.warning('Choose a resolution for each order-level discrepancy.');
+      messageApi.warning('Choose a resolution for each quantity or cost discrepancy.');
       return;
     }
 
@@ -1480,7 +1483,10 @@ function App() {
   const openReimCreate = () => {
     invoiceItemsReadId.current += 1;
     setPendingInvoiceItems(null);
-    setInvoiceDraft({ ...emptyInvoiceDraft, items: [createInvoiceDraftItem()] });
+    const today = localDateInputValue(new Date());
+    const draft = { ...emptyInvoiceDraft, invoiceDate: today, dueDate: today, items: [createInvoiceDraftItem()] };
+    createDraftBaseline.current = draft;
+    setInvoiceDraft(draft);
     setDetailDraftBaseline(null);
     setEditingInvoice(false);
     detailInvoiceAtOpen.current = null;
@@ -1511,7 +1517,19 @@ function App() {
     invoiceItemsReadId.current += 1;
     setPendingInvoiceItems(null);
     setTaxEditorOpen(false);
+    setDiscardInvoiceDraftOpen(false);
+    createDraftBaseline.current = null;
     setReimCreateOpen(false);
+  };
+
+  const requestCloseReimCreate = () => {
+    if (savingInvoice) return;
+    if (!detailDraftBaseline && createDraftBaseline.current
+      && JSON.stringify(invoiceDraft) !== JSON.stringify(createDraftBaseline.current)) {
+      setDiscardInvoiceDraftOpen(true);
+      return;
+    }
+    closeReimCreate();
   };
 
   const downloadInvoiceItems = () => {
@@ -1643,6 +1661,10 @@ function App() {
       messageApi.warning(`Complete the required fields: ${missingFields.join(', ')}.`);
       return;
     }
+    if (invoiceNumberExists(invoices, invoiceDraft.invoiceNo, invoiceDraft.supplierSite)) {
+      messageApi.warning('This invoice number already exists for the supplier site.');
+      return;
+    }
     if (itemError) {
       messageApi.warning(itemError);
       return;
@@ -1693,7 +1715,6 @@ function App() {
     setSelectedId(newInvoice.id);
     setActiveTab('matching');
     setLocalRuleApplied(false);
-    setMobileView('detail');
     closeReimCreate();
     messageApi.success('Invoice created in ReIM and added to the matching queue.');
   };
@@ -1731,16 +1752,7 @@ function App() {
     }
     setSavingInvoice(true);
     try {
-      let state: MockMatchState;
-      if (browserMatchDemo) {
-        state = await getBrowserMatches();
-      } else {
-        const response = await fetch('/api/mock/matches', { cache: 'no-store' });
-        if (!response.ok) throw new Error(`Match service returned ${response.status}.`);
-        const result: unknown = await response.json();
-        if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
-        state = result;
-      }
+      const state = await matchSession.getMatches();
       updateMatchState(state);
       const current = invoicesRef.current.find(invoice => invoice.id === original.id);
       if (!current || current.status !== 'Ready to Match' || state.matches.some(match => match.invoiceIds.includes(original.id))) {
@@ -1753,6 +1765,10 @@ function App() {
       }
       if (current !== original) {
         messageApi.warning('This invoice changed while you were editing. Close and reopen its details.');
+        return;
+      }
+      if (invoiceNumberExists(invoicesRef.current, invoiceDraft.invoiceNo, invoiceDraft.supplierSite, current.id)) {
+        messageApi.warning('This invoice number already exists for the supplier site.');
         return;
       }
       if (JSON.stringify(invoiceDraft) === JSON.stringify(detailDraftBaseline)) {
@@ -1870,36 +1886,7 @@ function App() {
       report.invoiceIds.includes(invoice.id) && invoice.status === 'Ready to Match' ? { ...invoice, hasException: true } : invoice
     ));
     setReportOpen(false);
-    messageApi.success(`Exception report for Order #${reportOrderNo} recorded in the prototype.`);
-  };
-
-  // PHASE 2 ENHANCEMENT: Handle tax correction request
-  const handleTaxCorrection = () => {
-    if (!taxCorrectionReason.trim() || !taxCorrectionComment.trim()) {
-      messageApi.warning('Please fill in both reason and comments before requesting tax correction.');
-      return;
-    }
-    
-    const timestamp = new Date().toLocaleString('en-AE');
-    const order = getFilteredOrders().find((o: any) => o.orderNo === taxOrderNo);
-    const invoiceTaxAmount = order?.invoices[0]?.legacyDetails?.taxCost || 0;
-    
-    setTaxDiscrepancies(current => ({
-      ...current,
-      [taxOrderNo]: {
-        status: 'Pending correction in Cognix',
-        currentTax: invoiceTaxAmount,
-        expectedTax: 0,
-        reason: taxCorrectionReason,
-        comment: taxCorrectionComment,
-        timestamp
-      }
-    }));
-    
-    setTaxCorrectionOpen(false);
-    setTaxCorrectionReason('');
-    setTaxCorrectionComment('');
-    messageApi.success(`Tax correction request sent to Cognix team for Order #${taxOrderNo}. Email notification sent.`);
+    messageApi.success(`Exception report for Order #${reportOrderNo} recorded.`);
   };
 
   // PHASE 2 ENHANCEMENT: Handle OFIN posting simulation
@@ -1939,8 +1926,16 @@ function App() {
       messageApi.error('A selected invoice is no longer available. Review the selection.');
       return;
     }
+    const selectedReceipts = receiptNos.map(receiptNo => getReceiptsForOrder(orderNo).find(receipt => receipt.receiptNo === receiptNo));
+    if (selectedReceipts.some(receipt => !receipt)) {
+      messageApi.error('A selected receipt is no longer available. Review the selection.');
+      return;
+    }
     const selectedDocuments = selectedInvoices.filter((invoice): invoice is Invoice => !!invoice);
+    const receiptDocuments = selectedReceipts.filter((receipt): receipt is Receipt => !!receipt);
     const currencies = new Set(selectedDocuments.map(invoice => invoice.currency));
+    const receiptCurrencies = new Set(receiptDocuments.map(receipt => receipt.currency));
+    const receiptAmount = receiptDocuments.reduce((sum, receipt) => sum + receipt.amount, 0);
     const savedResolution = getCurrentOrderResolution(orderNo);
     const details: MatchDetails = {
       invoiceNumbers: selectedDocuments.map(invoice => ({ id: invoice.id, number: invoice.invoiceNo })),
@@ -1953,42 +1948,29 @@ function App() {
       finalInvoiceCost: getCumulativeInvoiceCostByOrder(orderNo),
       quantityResolution: savedResolution?.quantity ?? {},
       costResolution: savedResolution?.cost ?? {},
+      costResolutionScope: savedResolution
+        ? (savedResolution.isAggregate ? 'aggregate' : 'unit')
+        : (selectedDocuments.length !== 1 || receiptNos.length !== 1 || selectedDocuments[0].lines.length !== 1
+          || Math.round(selectedDocuments[0].amount * 100) !== Math.round(selectedDocuments[0].lines[0].invoiceQty * selectedDocuments[0].lines[0].unitCost * 100)
+          ? 'aggregate' : 'unit'),
     };
     const matchedTotals = getMatchedTotals(details, savedResolution?.isAggregate ? 'aggregate' : 'unit');
     if (matchedTotals.quantity === undefined || matchedTotals.amount === undefined) {
       messageApi.error('Unable to determine matched totals. Review the resolution choices.');
       return;
     }
-    details.matchedTotals = { quantity: matchedTotals.quantity, amount: matchedTotals.amount };
+    const matchedAmount = matchedTotals.amount;
+    const matchedQuantity = matchedTotals.quantity;
+    details.matchedTotals = { quantity: matchedQuantity, amount: matchedAmount };
     setPostingOrderNo(orderNo);
     setPostingConfirmationOpen(false);
-    setPostingProgressOpen(true);
     
     try {
       const request = { orderNo, invoiceIds: selectedInvoiceIds, receiptNos, details };
-      let data: MockMatchState;
-      let conflict: boolean;
-      if (browserMatchDemo) {
-        const result = await saveBrowserMatch(request);
-        data = result.state;
-        conflict = result.conflict;
-      } else {
-        const response = await fetch('/api/mock/matches', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(request),
-        });
-        const result: unknown = await response.json();
-        if (response.status !== 409 && !response.ok) throw new Error(`Match service returned ${response.status}.`);
-        if (!isMockMatchState(result)) throw new Error('Match service returned invalid data.');
-        data = result;
-        conflict = response.status === 409;
-      }
+      const { state: data, conflict } = await matchSession.saveMatch(request);
       if (conflict) {
         updateMatchState(data);
-        messageApi.warning(browserMatchDemo
-          ? 'An invoice or receipt was already matched in this browser. Review the updated selection.'
-          : 'An invoice or receipt was matched by another user. Review the updated selection.');
+        messageApi.warning('An invoice or receipt was already matched. Review the updated selection.');
         return;
       }
       updateMatchState(data);
@@ -2000,21 +1982,21 @@ function App() {
         [orderNo]: {
           status: 'Scheduled',
           referenceNumber: `OFIN-${Date.now()}`,
-          lineItems: [
-            {accountCode: '1200-00-000', amount: 15000, glDate: new Date().toLocaleDateString('en-AE'), description: 'Invoice AP Liability'},
-            {accountCode: '5500-00-000', amount: 15000, glDate: new Date().toLocaleDateString('en-AE'), description: 'Expense Recognition'}
-          ],
+          currency: details.currency,
+          receiptCurrency: receiptCurrencies.size === 1 ? receiptDocuments[0].currency : null,
+          invoiceNumbers: details.invoiceNumbers.map(invoice => invoice.number),
+          receiptNos,
+          matchedQuantity,
+          matchedAmount,
+          lineItems: getFinancePostingLines(receiptAmount, now),
           timestamp
         }
       }));
       setPostingConfirmationOpen(true);
-      messageApi.success(`Order #${orderNo} matched and scheduled for simulated batch posting.`);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unable to reach the match service.';
       setMatchServiceError(errorMessage);
       messageApi.error(`Match was not confirmed: ${errorMessage}`);
-    } finally {
-      setPostingProgressOpen(false);
     }
   };
 
@@ -2039,7 +2021,6 @@ function App() {
     clearWorkbenchFilters();
     setOrderPageSize(10);
     setActiveTab('matching');
-    setMobileView('queue');
     window.scrollTo({ top: 0 });
   };
 
@@ -2176,7 +2157,6 @@ function App() {
             mode="inline"
             selectedKeys={[]}
             items={[{ key: 'settings', icon: <SettingOutlined />, label: 'Settings' }]}
-            onClick={() => messageApi.info('Settings are not connected in this prototype.')}
             className="secondary-menu"
           />
         </div>
@@ -2210,12 +2190,6 @@ function App() {
             </Space>
           </div>
 
-          {browserMatchDemo && (
-            <Typography.Paragraph>
-              Demo mode: matches are saved in this browser only and are not shared with other users.
-            </Typography.Paragraph>
-          )}
-
           <div className="metrics-row">
             <Card className="metric-card"><Statistic title={<span title="Ready to Match plus Matched Today">Pending Invoices</span>} value={pendingInvoices} /></Card>
             <Card className="metric-card"><Statistic title={<span title="Count based on invoice status, not current selections">Invoices: Ready to Match</span>} value={readyToMatch} valueStyle={{ color: '#1677ff' }} /></Card>
@@ -2226,9 +2200,8 @@ function App() {
           <div className="workbench-heading">
             <div className="workbench-title-wrap">
               <Typography.Title level={5} className="workbench-title">Matching workbench</Typography.Title>
-              <Tag bordered={false} className="queue-count">{filteredOrders.length} orders found</Tag>
             </div>
-            <Button type="text" icon={<SyncOutlined />} onClick={() => messageApi.success('Queue refreshed.')}>Refresh</Button>
+            <Button type="text" icon={<SyncOutlined />} onClick={() => window.location.reload()}>Refresh</Button>
           </div>
 
           {(!matchState || matchServiceError) && (
@@ -2237,11 +2210,6 @@ function App() {
               Receipt selection and match confirmation are unavailable until it connects.
             </div>
           )}
-
-          <div className="mobile-workbench-switch" role="group" aria-label="Workbench view">
-            <Button type={mobileView === 'queue' ? 'primary' : 'default'} onClick={() => setMobileView('queue')}>Queue ({filteredOrders.length})</Button>
-            <Button type={mobileView === 'detail' ? 'primary' : 'default'} onClick={() => setMobileView('detail')}>Invoice details</Button>
-          </div>
 
           <div className="workbench-filters">
             <div className="workbench-filters-grid">
@@ -2556,9 +2524,31 @@ function App() {
                           && !resolutionRecorded;
                         const originalQtyVariance = savedResolution ? savedResolution.originalInvoiceQty - savedResolution.originalReceiptQty : qtyVariance;
                         const originalCostVariance = savedResolution ? savedResolution.originalInvoiceCost - savedResolution.originalReceiptCost : costVariance;
+                        const selectedInvoiceIds = selectedInvoicesByOrder[order.orderNo] || [];
+                        const selectedReceiptNos = selectedReceiptsByOrder[order.orderNo] || [];
+                        const singleInvoice = selectedInvoiceIds.length === 1 ? invoices.find(invoice => invoice.id === selectedInvoiceIds[0]) : undefined;
+                        const singleReceipt = selectedReceiptNos.length === 1 ? getReceiptsForOrder(order.orderNo).find(receipt => receipt.receiptNo === selectedReceiptNos[0]) : undefined;
+                        const singleLine = singleInvoice?.lines.length === 1 ? singleInvoice.lines[0] : undefined;
+                        const costVariesWithQuantity = !!singleInvoice && !!singleLine && !!singleReceipt && singleReceipt.quantity > 0
+                          && Math.round(singleInvoice.amount * 100) === Math.round(singleLine.invoiceQty * singleLine.unitCost * 100)
+                          && !unitCostsDiffer(singleLine.unitCost, singleReceipt.amount / singleReceipt.quantity);
+                        const selectedItemDifferences = getItemNumberDifferences(
+                          invoices.filter(invoice => (selectedInvoicesByOrder[order.orderNo] || []).includes(invoice.id))
+                            .flatMap(invoice => invoice.lines.map(line => line.item)),
+                          getReceiptsForOrder(order.orderNo).filter(receipt => (selectedReceiptsByOrder[order.orderNo] || []).includes(receipt.receiptNo))
+                            .flatMap(receipt => receipt.items.map(item => item.item)),
+                        );
                         
                         return (
                           <>
+                            {(selectedItemDifferences.invoiceOnly.length > 0 || selectedItemDifferences.receiptOnly.length > 0) && (
+                              <div role="alert" style={{marginBottom: 12, padding: 12, background: '#fffbe6', border: '1px solid #ffe58f', borderRadius: 6}}>
+                                <strong>Item numbers differ across the selected invoices and receipts.</strong>
+                                <div>Review the selected documents before matching. You can still proceed.</div>
+                                {selectedItemDifferences.invoiceOnly.length > 0 && <div>Only on invoices: {selectedItemDifferences.invoiceOnly.join(', ')}</div>}
+                                {selectedItemDifferences.receiptOnly.length > 0 && <div>Only on receipts: {selectedItemDifferences.receiptOnly.join(', ')}</div>}
+                              </div>
+                            )}
                             {/* TOLERANCE VISIBILITY */}
                             <div className="tolerance-display">
                               <div className="tolerance-section-title">Tolerance Settings</div>
@@ -2601,7 +2591,9 @@ function App() {
                                     {matchStatus !== 'exceeds-tolerance' && originalCostVariance !== 0 && (
                                       <span className="tolerance-resolution">{selectedMatched
                                         ? (selectedReady ? 'Select unmatched invoices to resolve' : 'Variance in completed selection')
-                                        : resolutionLabel(savedResolution?.cost)}</span>
+                                        : (savedResolution && !savedResolution.isAggregate && !savedResolution.cost.type) || (!savedResolution && costVariesWithQuantity)
+                                          ? 'Amount varies with quantity'
+                                          : resolutionLabel(savedResolution?.cost)}</span>
                                     )}
                                   </div>
                                 </div>
@@ -2638,16 +2630,6 @@ function App() {
                                   >
                                     Confirm Match
                                   </Button>
-                                  <Button 
-                                    onClick={() => {
-                                      setTaxOrderNo(order.orderNo);
-                                      setTaxCorrectionReason('');
-                                      setTaxCorrectionComment('');
-                                      setTaxCorrectionOpen(true);
-                                    }}
-                                  >
-                                    Review Tax
-                                  </Button>
                                 </>
                               ) : matchStatus === 'within-tolerance' ? (
                                 <>
@@ -2664,16 +2646,6 @@ function App() {
                                     }}
                                   >
                                     Confirm Match
-                                  </Button>
-                                  <Button 
-                                    onClick={() => {
-                                      setTaxOrderNo(order.orderNo);
-                                      setTaxCorrectionReason('');
-                                      setTaxCorrectionComment('');
-                                      setTaxCorrectionOpen(true);
-                                    }}
-                                  >
-                                    Review Tax
                                   </Button>
                                 </>
                               ) : (
@@ -2766,7 +2738,8 @@ function App() {
                   differs: comparison.invoiceQty !== comparison.receiptQty, choice: details?.quantityResolution },
                 { title: 'Amount', invoice: formatCost(comparison.invoiceCost), receipt: formatCost(comparison.receiptCost),
                   variance: formatCost(comparison.invoiceCost - comparison.receiptCost),
-                  differs: comparison.invoiceCost !== comparison.receiptCost, choice: details?.costResolution },
+                  differs: comparison.invoiceCost !== comparison.receiptCost, choice: details?.costResolution,
+                  unitCost: details?.costResolutionScope === 'unit' },
               ];
               return (
                 <div className="match-outcome">
@@ -2788,9 +2761,10 @@ function App() {
                           <div className={section.differs ? 'match-variance' : ''}><dt>Variance</dt><dd>{section.variance}</dd></div>
                         </dl>
                         <div className="match-basis">
-                          <span>Matching basis</span>
-                          <strong>{basisLabel(section.choice, section.differs)}</strong>
+                          <span>{section.unitCost ? 'Unit cost basis' : section.title === 'Amount' && details && !details.costResolutionScope ? 'Recorded cost choice' : 'Matching basis'}</span>
+                          <strong>{basisLabel(section.choice, section.unitCost ? !!section.choice?.type : section.differs)}</strong>
                         </div>
+                        {section.unitCost && <div className="match-resolution-note">Matched amount is calculated from the matched quantity and unit cost.</div>}
                         {section.choice?.reasonCode && (
                           <div className="match-resolution-note">Reason: {resolutionReasons[section.choice.reasonCode] ?? section.choice.reasonCode}</div>
                         )}
@@ -2801,7 +2775,6 @@ function App() {
                   <div className="match-confirmed-totals">
                     <div>
                       <strong>Matched totals</strong>
-                      <span>Values accepted for matching.</span>
                     </div>
                     <div><span>Quantity</span><strong>{matchedTotals?.quantity === undefined ? 'Unavailable' : `${matchedTotals.quantity} units`}</strong></div>
                     <div><span>Amount</span><strong>{matchedTotals?.amount === undefined ? 'Unavailable' : formatCost(matchedTotals.amount)}</strong></div>
@@ -2871,7 +2844,7 @@ function App() {
         className="invoice-maintenance-modal"
         title={<div className="invoice-maintenance-title"><span>{detailDraftBaseline ? 'Invoice Details' : 'Invoice Maintenance'}</span><Tag color="processing">{detailDraftBaseline ? detailInvoice?.status : 'New Merchandise Invoice'}</Tag></div>}
         open={reimCreateOpen}
-        onCancel={closeReimCreate}
+        onCancel={requestCloseReimCreate}
         closable={!savingInvoice}
         maskClosable={!savingInvoice}
         keyboard={!savingInvoice}
@@ -2889,7 +2862,7 @@ function App() {
             ? <Button key="save" type="primary" loading={savingInvoice} onClick={() => void handleSaveInvoice()}>Save</Button>
             : <Button key="edit" type="primary" disabled={!detailInvoice || detailInvoice.status !== 'Ready to Match' || !matchState || !!matchServiceError || !!getInvoiceMatch(detailInvoice.orderNo, detailInvoice.id)} onClick={() => setEditingInvoice(true)}>Edit</Button>,
         ] : [
-          <Button key="cancel" onClick={closeReimCreate}>Cancel</Button>,
+          <Button key="cancel" onClick={requestCloseReimCreate}>Cancel</Button>,
           <Button key="create" type="primary" onClick={handleCreateReimInvoice}>Create invoice</Button>,
         ]}
         width={1120}
@@ -3006,6 +2979,18 @@ function App() {
           </div>
         </div>
         </ConfigProvider>
+      </Modal>
+
+      <Modal
+        title="Discard invoice draft?"
+        open={discardInvoiceDraftOpen}
+        onCancel={() => setDiscardInvoiceDraftOpen(false)}
+        onOk={closeReimCreate}
+        okText="Discard draft"
+        cancelText="Keep editing"
+        okButtonProps={{ danger: true }}
+      >
+        <p>Your unsaved invoice details will be lost.</p>
       </Modal>
 
       <Modal
@@ -3181,7 +3166,7 @@ function App() {
               </div>
 
               {resolutionIsAggregate && (
-                <p className="resolution-explanation">Choose which totals to accept. This records the decision without changing invoice or receipt amounts.</p>
+                <p className="resolution-explanation">Choose the matching totals. This records the decision without changing invoice or receipt amounts.</p>
               )}
               {!resolutionIsAggregate && (!resolutionLine || receiptCost === undefined) ? (
                 <p>A valid invoice item and receipt with a positive quantity are required to resolve discrepancies.</p>
@@ -3189,7 +3174,7 @@ function App() {
                 <p>Quantity and unit cost match for this item and receipt. Order totals may still differ.</p>
               ) : null}
               <div className="discrepancy-resolution-grid">
-                {(resolutionIsAggregate || (resolutionLine && receiptCost !== undefined)) && (
+                {(resolutionIsAggregate ? invoiceQty !== receiptQty : resolutionQtyMismatch) && (
                   <section className="discrepancy-resolution-panel">
                     <h4 id="quantity-discrepancy-heading">Quantity Discrepancy</h4>
                     <Radio.Group
@@ -3233,7 +3218,7 @@ function App() {
                   </section>
                 )}
 
-                {(resolutionIsAggregate || resolutionLine) && receiptCost !== undefined && (
+                {(resolutionIsAggregate ? invoiceCost !== receiptCost : resolutionCostMismatch) && receiptCost !== undefined && (
                   <section className="discrepancy-resolution-panel">
                     <h4 id="cost-discrepancy-heading">Cost Discrepancy</h4>
                     <Radio.Group
@@ -3275,6 +3260,9 @@ function App() {
                       </div>
                     </div>
                   </section>
+                )}
+                {!resolutionIsAggregate && !resolutionCostMismatch && receiptCost !== undefined && (
+                  <p>Unit cost has no variance. Any amount difference is due to quantity.</p>
                 )}
               </div>
             </div>
@@ -3547,135 +3535,18 @@ function App() {
         })()}
       </Modal>
 
-      {/* PHASE 2: TAX CORRECTION REQUEST MODAL */}
-      <Modal
-        className="tax-correction-modal"
-        title="Request Tax Correction in Cognix"
-        open={taxCorrectionOpen}
-        onCancel={() => setTaxCorrectionOpen(false)}
-        width={600}
-        footer={[
-          <Button key="cancel" onClick={() => setTaxCorrectionOpen(false)}>Cancel</Button>,
-          <Button 
-            key="submit" 
-            type="primary"
-            onClick={handleTaxCorrection}
-            disabled={!taxCorrectionReason}
-          >
-            Send to Cognix Team
-          </Button>,
-        ]}
-      >
-        {(() => {
-          const order = getFilteredOrders().find((o: any) => o.orderNo === taxOrderNo);
-          if (!order) return null;
-          
-          const invoice = order.invoices[0];
-          const currentTax = invoice?.legacyDetails?.taxCost || 0;
-          const taxRate = invoice?.legacyDetails?.taxRate || 0;
-          
-          return (
-            <div>
-              <div className="escalation-summary" style={{marginBottom: 20, padding: 12, background: '#f5f5f5', borderRadius: 4}}>
-                <div style={{marginBottom: 12}}>
-                  <div style={{fontSize: 11, color: '#999', marginBottom: 2}}>Order Number</div>
-                  <div style={{fontWeight: 600, fontSize: 14}}>{taxOrderNo}</div>
-                </div>
-                <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12}}>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 2}}>Invoice No</div>
-                    <div style={{fontWeight: 600}}>{invoice?.invoiceNo}</div>
-                  </div>
-                  <div>
-                    <div style={{fontSize: 11, color: '#999', marginBottom: 2}}>Current Tax</div>
-                    <div style={{color: '#ad6800', fontWeight: 600}}>{money(currentTax)} ({taxRate}%)</div>
-                  </div>
-                </div>
-              </div>
-              
-              <div style={{marginBottom: 16}}>
-                <label style={{display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 8, color: '#262626'}}>
-                  Reason for Tax Adjustment <span style={{color: '#ff4d4f'}}>*</span>
-                </label>
-                <Select
-                  placeholder="Select reason for tax adjustment"
-                  value={taxCorrectionReason}
-                  onChange={setTaxCorrectionReason}
-                  options={[
-                    {label: 'Tax rate mismatch with supplier', value: 'rate_mismatch'},
-                    {label: 'Tax exemption not applied', value: 'exemption_missing'},
-                    {label: 'Regional tax requirement', value: 'regional_requirement'},
-                    {label: 'Invoice calculation error', value: 'calc_error'},
-                    {label: 'Other tax discrepancy', value: 'other'},
-                  ]}
-                  style={{width: '100%'}}
-                />
-              </div>
-              
-              <div style={{marginBottom: 16}}>
-                <label style={{display: 'block', fontSize: 12, fontWeight: 600, marginBottom: 8, color: '#262626'}}>
-                  Comments for Cognix Team
-                </label>
-                <Input.TextArea
-                  placeholder="Provide details about the tax issue and expected adjustment..."
-                  rows={3}
-                  value={taxCorrectionComment}
-                  onChange={(e) => setTaxCorrectionComment(e.target.value)}
-                  style={{fontFamily: 'inherit'}}
-                />
-              </div>
-              
-              <div style={{padding: 12, background: '#f9f0f4', borderRadius: 4, fontSize: 12}}>
-                <div style={{marginBottom: 8}}><strong>ⓘ Next Steps:</strong></div>
-                <ul style={{margin: 0, paddingLeft: 20}}>
-                  <li>Cognix team will review the tax discrepancy</li>
-                  <li>Invoice will be revised and republished</li>
-                  <li>You will receive notification when corrected invoice is ready</li>
-                  <li>Matching will resume after tax is verified</li>
-                </ul>
-              </div>
-            </div>
-          );
-        })()}
-      </Modal>
-
-      {/* PHASE 2: POSTING PROGRESS MODAL */}
-      <Modal
-        className="posting-progress-modal"
-        title="Processing Match for Batch Posting..."
-        open={postingProgressOpen}
-        closable={false}
-        footer={null}
-        width={500}
-      >
-        <div style={{textAlign: 'center', padding: 40}}>
-          <SyncOutlined style={{fontSize: 48, color: '#1890ff', animation: 'spin 1s linear infinite', marginBottom: 16}} />
-          <h3>Processing Match for Batch Posting</h3>
-          <p style={{color: '#666', marginBottom: 20}}>Order #{postingOrderNo} match is being validated and scheduled for OFIN batch posting...</p>
-          <div style={{marginTop: 20, padding: 12, background: '#f5f5f5', borderRadius: 4, fontSize: 12}}>
-            <div style={{marginBottom: 8}}>
-              <div style={{color: '#999', marginBottom: 2}}>Invoice Total</div>
-              <div style={{fontWeight: 600}}>{money(getCumulativeInvoiceCostByOrder(postingOrderNo))}</div>
-            </div>
-            <div>
-              <div style={{color: '#999', marginBottom: 2}}>Status</div>
-              <div style={{color: '#1890ff', fontWeight: 600}}>Validating match and preparing for batch posting...</div>
-            </div>
-          </div>
-        </div>
-      </Modal>
-
       {/* PHASE 2: OFIN POSTING CONFIRMATION MODAL */}
       <Modal
         className="ofin-confirmation-modal"
-        title="Match Confirmed & Scheduled for Batch Posting"
+        title="Match Confirmed & Scheduled for Finance Posting"
         open={postingConfirmationOpen && offinPostings[postingOrderNo]?.status === 'Scheduled'}
         onCancel={() => setPostingConfirmationOpen(false)}
-        width={600}
+        width={720}
+        centered
         footer={[
           <Button key="ok" type="primary" onClick={() => {
             setPostingConfirmationOpen(false);
-            messageApi.success(`Order #${postingOrderNo} match confirmed for simulated batch posting.`);
+            messageApi.success(`Order #${postingOrderNo} match confirmed and scheduled for finance posting.`);
           }}>
             OK
           </Button>,
@@ -3684,53 +3555,66 @@ function App() {
         {(() => {
           const posting = offinPostings[postingOrderNo];
           if (!posting) return null;
-          
+          const formatAmount = (amount: number, currency: string | null) => currency
+            ? money(amount, currency)
+            : `${new Intl.NumberFormat('en-AE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount)} (mixed currencies)`;
+
           return (
-            <div>
-              <div style={{display: 'flex', alignItems: 'center', marginBottom: 20, padding: 12, background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 4}}>
-                <CheckCircleFilled style={{fontSize: 24, color: '#389e0d', marginRight: 12}} />
+            <div className="posting-confirmation">
+              <div className="posting-confirmation-status">
+                <CheckCircleFilled className="posting-confirmation-icon" />
                 <div>
-                  <div style={{fontWeight: 600, color: '#389e0d'}}>Match Confirmed & Scheduled for Batch Posting</div>
-                  <div style={{fontSize: 12, color: '#666', marginTop: 4}}>Order #{postingOrderNo} is scheduled for simulated posting - {posting.timestamp}</div>
+                  <strong>Match confirmed</strong>
+                  <span>Scheduled for finance posting</span>
                 </div>
               </div>
-              
-              <div style={{marginBottom: 16, padding: 12, background: '#e6f7ff', border: '1px solid #91d5ff', borderRadius: 4}}>
-                <div style={{fontSize: 12, color: '#0050b3', fontWeight: 500}}>
-                  {browserMatchDemo
-                    ? 'ⓘ The demo changes matched invoices to Posted after the browser’s local day changes. No live OFIN posting occurs.'
-                    : 'ⓘ The mock service changes matched invoices to Posted after the server’s day changes. No live OFIN posting occurs.'}
+
+              <section className="posting-summary" aria-label="Matched totals">
+                <div>
+                  <span>Matched amount</span>
+                  <strong>{formatAmount(posting.matchedAmount, posting.currency)}</strong>
                 </div>
-              </div>
-              
-              <div style={{marginBottom: 16}}>
-                <div style={{fontSize: 12, fontWeight: 600, marginBottom: 8, color: '#262626'}}>OFIN Reference</div>
-                <div style={{padding: 8, background: '#f5f5f5', borderRadius: 4, fontFamily: 'monospace', fontSize: 12}}>
-                  {posting.referenceNumber}
+                <div>
+                  <span>Matched quantity</span>
+                  <strong>{posting.matchedQuantity} units</strong>
                 </div>
-              </div>
-              
-              <div>
-                <div style={{fontSize: 12, fontWeight: 600, marginBottom: 8, color: '#262626'}}>GL Line Items to be Posted</div>
-                <table style={{width: '100%', fontSize: 11, borderCollapse: 'collapse'}}>
-                  <thead>
-                    <tr style={{borderBottom: '1px solid #f0f0f0'}}>
-                      <th style={{textAlign: 'left', padding: 8, color: '#999'}}>Account Code</th>
-                      <th style={{textAlign: 'right', padding: 8, color: '#999'}}>Amount (AED)</th>
-                      <th style={{textAlign: 'left', padding: 8, color: '#999'}}>GL Date</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {posting.lineItems.map((item: any, idx: number) => (
-                      <tr key={idx} style={{borderBottom: '1px solid #f5f5f5'}}>
-                        <td style={{padding: 8}}>{item.accountCode}</td>
-                        <td style={{textAlign: 'right', padding: 8, fontWeight: 600}}>{money(item.amount)}</td>
-                        <td style={{padding: 8}}>{item.glDate}</td>
+              </section>
+
+              <section className="posting-details" aria-labelledby="posting-details-heading">
+                <h4 id="posting-details-heading">Match details</h4>
+                <dl>
+                  <div><dt>Order</dt><dd>{postingOrderNo}</dd></div>
+                  <div><dt>OFIN reference</dt><dd>{posting.referenceNumber}</dd></div>
+                  <div><dt>{posting.invoiceNumbers.length === 1 ? 'Invoice' : 'Invoices'}</dt><dd>{posting.invoiceNumbers.join(', ')}</dd></div>
+                  <div><dt>{posting.receiptNos.length === 1 ? 'Receipt' : 'Receipts'}</dt><dd>{posting.receiptNos.join(', ')}</dd></div>
+                </dl>
+              </section>
+
+              <section className="posting-gl" aria-labelledby="posting-gl-heading">
+                <h4 id="posting-gl-heading">GL line items to be posted</h4>
+                <div className="posting-gl-table-wrap">
+                  <table className="ofin-line-items-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Account</th>
+                        <th scope="col">Description</th>
+                        <th scope="col" className="posting-gl-amount">Amount</th>
+                        <th scope="col">GL date</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {posting.lineItems.map((item, idx) => (
+                        <tr key={idx}>
+                          <td>{item.accountCode}</td>
+                          <td>{item.description}</td>
+                          <td className="posting-gl-amount">{formatAmount(item.amount, posting.receiptCurrency)}</td>
+                          <td>{item.glDate}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </div>
           );
         })()}

@@ -15,6 +15,7 @@ export type MatchDetails = {
   finalInvoiceCost: number;
   quantityResolution: MatchResolution;
   costResolution: MatchResolution;
+  costResolutionScope?: 'unit' | 'aggregate';
   matchedTotals?: { quantity: number; amount: number };
 };
 
@@ -202,7 +203,8 @@ export const isMatchDetails = (value: unknown): value is MatchDetails => {
       && typeof details.matchedTotals.quantity === 'number' && Number.isFinite(details.matchedTotals.quantity)
       && typeof details.matchedTotals.amount === 'number' && Number.isFinite(details.matchedTotals.amount)
     ))
-    && isMatchResolution(details.quantityResolution) && isMatchResolution(details.costResolution);
+    && isMatchResolution(details.quantityResolution) && isMatchResolution(details.costResolution)
+    && (details.costResolutionScope === undefined || details.costResolutionScope === 'unit' || details.costResolutionScope === 'aggregate');
 };
 
 export const isMockMatchState = (value: unknown): value is MockMatchState => {
