@@ -14,12 +14,13 @@ let getItemNumberDifferences;
 let localDateInputValue;
 let unitCostsDiffer;
 let costResolutionRequired;
+let updateOrderSelection;
 
 before(async () => {
   server = await createServer({ logLevel: 'silent', server: { middlewareMode: true } });
   ({ getInvoiceItemTotals, validateInvoiceItems, invoiceFinancialsChanged, reconcileInvoiceLines } = await server.ssrLoadModule('/src/invoiceItems.ts'));
   ({ exportInvoiceItemsCsv, importInvoiceItemsCsv } = await server.ssrLoadModule('/src/invoiceItemsCsv.ts'));
-  ({ hasDuplicateInvoice, getItemNumberDifferences, localDateInputValue, unitCostsDiffer, costResolutionRequired } = await server.ssrLoadModule('/src/matchingRules.ts'));
+  ({ hasDuplicateInvoice, getItemNumberDifferences, localDateInputValue, unitCostsDiffer, costResolutionRequired, updateOrderSelection } = await server.ssrLoadModule('/src/matchingRules.ts'));
 });
 
 after(async () => {
@@ -27,6 +28,21 @@ after(async () => {
 });
 
 const item = (id, quantity, unitCost) => ({ id, item: id, description: '', quantity, unitCost });
+
+test('selecting another order clears both invoice and receipt selections', () => {
+  let selected = { invoicesByOrder: {}, receiptsByOrder: {} };
+  selected = updateOrderSelection(selected, 'A', 'invoice', 'i1', true);
+  selected = updateOrderSelection(selected, 'A', 'invoice', 'i2', true);
+  selected = updateOrderSelection(selected, 'A', 'receipt', 'r1', true);
+  assert.deepEqual(selected, { invoicesByOrder: { A: ['i1', 'i2'] }, receiptsByOrder: { A: ['r1'] } });
+  selected = updateOrderSelection(selected, 'B', 'invoice', 'i3', true);
+  assert.deepEqual(selected, { invoicesByOrder: { B: ['i3'] }, receiptsByOrder: { B: [] } });
+  selected = updateOrderSelection(selected, 'B', 'receipt', 'r2', true);
+  selected = updateOrderSelection(selected, 'A', 'receipt', 'r1', true);
+  assert.deepEqual(selected, { invoicesByOrder: { A: [] }, receiptsByOrder: { A: ['r1'] } });
+  selected = updateOrderSelection(selected, 'A', 'receipt', 'r1', false);
+  assert.deepEqual(selected, { invoicesByOrder: { A: [] }, receiptsByOrder: { A: [] } });
+});
 
 test('item totals include each line and update when a line is removed', () => {
   const items = [item('A', 3, 10.25), item('B', 2, 4.5)];

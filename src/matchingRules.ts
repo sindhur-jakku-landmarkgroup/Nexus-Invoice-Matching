@@ -1,5 +1,21 @@
 const normalize = (value: string) => value.trim().toLocaleUpperCase();
 
+export type OrderSelections = {
+  invoicesByOrder: Record<string, string[]>;
+  receiptsByOrder: Record<string, string[]>;
+};
+
+export const updateOrderSelection = (
+  current: OrderSelections, orderNo: string, kind: 'invoice' | 'receipt', id: string, checked: boolean,
+): OrderSelections => {
+  const invoices = checked ? { [orderNo]: current.invoicesByOrder[orderNo] ?? [] } : { ...current.invoicesByOrder };
+  const receipts = checked ? { [orderNo]: current.receiptsByOrder[orderNo] ?? [] } : { ...current.receiptsByOrder };
+  const selected = kind === 'invoice' ? invoices : receipts;
+  const items = selected[orderNo] ?? [];
+  selected[orderNo] = checked ? [...items.filter(item => item !== id), id] : items.filter(item => item !== id);
+  return { invoicesByOrder: invoices, receiptsByOrder: receipts };
+};
+
 export const hasDuplicateInvoice = (
   invoices: { id: string; invoiceNo: string; supplierSite: string }[],
   invoiceNo: string,

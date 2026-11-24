@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent } from 'react';
 import {
   ArrowLeftOutlined,
@@ -54,7 +54,8 @@ import { createBrowserMatchSession } from './browserMatches';
 import { createInvoiceDraftItem, getInvoiceItemAmount, getInvoiceItemTotals, invoiceFinancialsChanged, reconcileInvoiceLines, validateInvoiceItems } from './invoiceItems';
 import type { InvoiceDraftItem } from './invoiceItems';
 import { exportInvoiceItemsCsv, importInvoiceItemsCsv } from './invoiceItemsCsv';
-import { costResolutionRequired, getItemNumberDifferences, hasDuplicateInvoice, localDateInputValue, unitCostsDiffer } from './matchingRules';
+import { costResolutionRequired, getItemNumberDifferences, hasDuplicateInvoice, localDateInputValue, unitCostsDiffer, updateOrderSelection } from './matchingRules';
+import type { OrderSelections } from './matchingRules';
 import { getCurrentMatchComparison, getMatchedTotals } from './mockMatches';
 import type { MatchDetails, MatchResolution, MockMatch, MockMatchState } from './mockMatches';
 
@@ -978,10 +979,27 @@ function App() {
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [orderPage, setOrderPage] = useState(1);
   const [orderPageSize, setOrderPageSize] = useState(10);
-  const [selectedInvoicesByOrder, setSelectedInvoicesByOrder] = useState<Record<string, string[]>>({});
-  const [selectedReceiptsByOrder, setSelectedReceiptsByOrder] = useState<Record<string, string[]>>({});
+  const [orderSelections, setOrderSelections] = useState<OrderSelections>({
+    invoicesByOrder: {}, receiptsByOrder: {},
+  });
+  const selectionAnchor = useRef<{ element: HTMLElement; top: number } | null>(null);
+  const { invoicesByOrder: selectedInvoicesByOrder, receiptsByOrder: selectedReceiptsByOrder } = orderSelections;
   const [orderResolutions, setOrderResolutions] = useState<Record<string, OrderResolution>>({});
   const [matchDetailsKey, setMatchDetailsKey] = useState<{ orderNo: string; invoiceId: string } | null>(null);
+
+  useLayoutEffect(() => {
+    const anchor = selectionAnchor.current;
+    selectionAnchor.current = null;
+    if (anchor?.element.isConnected) {
+      window.scrollBy(0, anchor.element.getBoundingClientRect().top - anchor.top);
+    }
+  }, [orderSelections]);
+
+  const rememberSelectionPosition = (target: EventTarget | null) => {
+    if (target instanceof HTMLElement) {
+      selectionAnchor.current = { element: target, top: target.getBoundingClientRect().top };
+    }
+  };
 
   const updateMatchState = (next: MockMatchState) => {
     setMatchState(current => !current || current.instanceId !== next.instanceId || next.version >= current.version ? next : current);
@@ -1217,8 +1235,7 @@ function App() {
       if (updatedReceipts[orderNo].length !== receiptNos.length) changedOrders.add(orderNo);
     });
     if (changedOrders.size) {
-      setSelectedInvoicesByOrder(updatedInvoices);
-      setSelectedReceiptsByOrder(updatedReceipts);
+      setOrderSelections({ invoicesByOrder: updatedInvoices, receiptsByOrder: updatedReceipts });
       setOrderResolutions(current => {
         const next = { ...current };
         changedOrders.forEach(orderNo => { delete next[orderNo]; });
@@ -2299,9 +2316,12 @@ function App() {
                       Some selected invoices are hidden by the current filters and are included in matching totals.{' '}
                       <Button type="link" size="small" style={{padding: 0}} onClick={() => {
                         clearOrderResolution(order.orderNo);
-                        setSelectedInvoicesByOrder(current => ({
+                        setOrderSelections(current => ({
                           ...current,
-                          [order.orderNo]: (current[order.orderNo] || []).filter(id => order.invoices.some(invoice => invoice.id === id)),
+                          invoicesByOrder: {
+                            ...current.invoicesByOrder,
+                            [order.orderNo]: (current.invoicesByOrder[order.orderNo] || []).filter(id => order.invoices.some(invoice => invoice.id === id)),
+                          },
                         }));
                       }}>Clear hidden selections</Button>
                     </div>
@@ -2389,13 +2409,10 @@ function App() {
                               disabled={!matchState || !!matchServiceError}
                               checked={(selectedInvoicesByOrder[order.orderNo] || []).includes(inv.id)}
                               onChange={(e) => {
-                                clearOrderResolution(order.orderNo);
-                                setSelectedInvoicesByOrder(current => ({
-                                  ...current,
-                                  [order.orderNo]: e.target.checked
-                                    ? [...(current[order.orderNo] || []), inv.id]
-                                    : (current[order.orderNo] || []).filter(id => id !== inv.id)
-                                }));
+                                const checked = e.target.checked;
+                                rememberSelectionPosition(e.nativeEvent.target);
+                                setOrderResolutions({});
+                                setOrderSelections(current => updateOrderSelection(current, order.orderNo, 'invoice', inv.id, checked));
                               }}
                             />}
                             <div style={{flex: 1, minWidth: 0}}>
@@ -2446,13 +2463,10 @@ function App() {
                               disabled={!matchState || !!matchServiceError}
                               checked={(selectedReceiptsByOrder[order.orderNo] || []).includes(receipt.receiptNo)}
                               onChange={(e) => {
-                                clearOrderResolution(order.orderNo);
-                                setSelectedReceiptsByOrder(current => ({
-                                  ...current,
-                                  [order.orderNo]: e.target.checked
-                                    ? [...(current[order.orderNo] || []), receipt.receiptNo]
-                                    : (current[order.orderNo] || []).filter(r => r !== receipt.receiptNo)
-                                }));
+                                const checked = e.target.checked;
+                                rememberSelectionPosition(e.nativeEvent.target);
+                                setOrderResolutions({});
+                                setOrderSelections(current => updateOrderSelection(current, order.orderNo, 'receipt', receipt.receiptNo, checked));
                               }}
                             />
                             <div style={{flex: 1, minWidth: 0}}>
